@@ -1,15 +1,14 @@
 --[[
-    ⚔️ FABLED AUTOFARM (Universal) — v2.9 (Smart Dodge Edition)
+    ⚔️ FABLED AUTOFARM (Universal) — v3.0 (Noir Edition)
 
-    • Esquiva inteligente: solo esquiva ataques que de verdad te alcanzan
-      (aprende el RANGO de cada ataque, no solo el timing) y las ventanas
-      de esquiva son mucho más cortas -> pegas mucho más.
-    • Anticipación y cola de la esquiva ajustables desde la UI.
-    • Respaldo reactivo corto cuando el ataque sí fue identificado.
-    • Aprendizaje más limpio (ignora animaciones Idle/Movement, prioriza Action,
-      limpia datos viejos sin confirmar).
-    • Objetivo "pegajoso": no cambia de enemigo a cada rato.
-    • Anti-AFK, contadores de esquivas y botón para borrar lo aprendido.
+    NOVEDADES v3.0
+    • AUTO-INICIO: el autofarm arranca solo al ejecutar el script
+      (chip "Auto-iniciar" para desactivarlo; se guarda en tu config).
+    • UI nueva en negro y blanco con glows animados:
+      borde con brillo giratorio, resplandor que "respira", destello de
+      entrada, rebote en botones, chips con glow, barra de vida suave,
+      línea de brillo que recorre el encabezado y animación al cerrar/ocultar.
+    • Toda la lógica de combate / esquiva inteligente de v2.9 se mantiene intacta.
 
     Atajos:  RightControl = iniciar / detener  ·  RightShift = ocultar / mostrar UI
 ]]
@@ -17,6 +16,8 @@
 -- ============================================================
 -- SERVICIOS Y CARGA LIMPIA
 -- ============================================================
+if not game:IsLoaded() then game.Loaded:Wait() end
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
@@ -27,9 +28,13 @@ local VirtualUser = game:GetService("VirtualUser")
 local GuiService = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    task.wait()
+    LocalPlayer = Players.LocalPlayer
+end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "2.9"
+local VERSION = "3.0"
 local GUI_NAME = "FabledAutofarmUI"
 
 local sharedEnv = (typeof(getgenv) == "function" and getgenv()) or _G
@@ -57,15 +62,15 @@ local TARGET_STICKY_DISTANCE = 12      -- el objetivo actual se conserva si otro
 
 -- Constantes de la esquiva suave
 local DODGE_MIN_DAMAGE_PERCENT = 0.02
-local DODGE_RISE_SPEED = 60            -- subir casi instantáneo (antes 40)
-local DODGE_FALL_SPEED = 18            -- bajar rápido (antes 7: era lo que más tiempo te quitaba)
+local DODGE_RISE_SPEED = 60            -- subir casi instantáneo
+local DODGE_FALL_SPEED = 18            -- bajar rápido
 local DODGE_REACTIVE_MAX = 0.15        -- esquiva reactiva corta cuando el ataque sí se identificó
 
 local HOTKEY_TOGGLE_FARM = Enum.KeyCode.RightControl
 local HOTKEY_TOGGLE_UI = Enum.KeyCode.RightShift
 
 local WINDOW_WIDTH = 340
-local HEADER_HEIGHT = 46
+local HEADER_HEIGHT = 50
 local BODY_PADDING_Y = 22
 
 -- ============================================================
@@ -84,7 +89,8 @@ local DEFAULTS = {
     UseSkillF = true,
     UseSkillR = true,
     UseClick = true,
-    AutoStart = true,
+    AutoStart = true,      -- pulsa el botón START del juego
+    AutoRun = true,        -- NUEVO: inicia el autofarm solo al ejecutar el script
     AntiAFK = true,
 }
 
@@ -326,7 +332,7 @@ local function clickMouse()
 end
 
 -- ============================================================
--- AUTO-START
+-- AUTO-START (botón START del juego)
 -- ============================================================
 local START_SCAN_INTERVAL = 3
 local START_RETRY_INTERVAL = 1.5
@@ -900,30 +906,40 @@ local function unload()
     table.clear(connections)
     if healthConnection then healthConnection:Disconnect(); healthConnection = nil end
     if ui.pulse then ui.pulse:Cancel() end
+    if ui.loops then
+        for _, loop in ipairs(ui.loops) do pcall(function() loop:Cancel() end) end
+    end
     if ui.gui then ui.gui:Destroy(); ui.gui = nil end
     sharedEnv.FabledAutofarm = nil
 end
 
 -- ============================================================
--- UI: TEMA Y UTILIDADES
+-- UI: TEMA NEGRO / BLANCO CON GLOWS
 -- ============================================================
+local WHITE = Color3.fromRGB(255, 255, 255)
+local BLACK = Color3.fromRGB(0, 0, 0)
+
 local THEME = {
-    Background = Color3.fromRGB(17, 19, 26), Surface = Color3.fromRGB(25, 28, 38),
-    SurfaceAlt = Color3.fromRGB(34, 38, 51), Stroke = Color3.fromRGB(52, 58, 78),
-    Accent = Color3.fromRGB(0, 170, 255), AccentDark = Color3.fromRGB(0, 98, 150),
-    Violet = Color3.fromRGB(139, 108, 255), Success = Color3.fromRGB(46, 204, 113),
-    SuccessButton = Color3.fromRGB(36, 168, 96), DangerButton = Color3.fromRGB(214, 69, 69),
-    Warning = Color3.fromRGB(245, 176, 65), Text = Color3.fromRGB(236, 239, 246),
-    TextDim = Color3.fromRGB(146, 154, 176), Muted = Color3.fromRGB(105, 112, 134),
+    Background = Color3.fromRGB(8, 8, 10), Surface = Color3.fromRGB(15, 15, 18),
+    SurfaceAlt = Color3.fromRGB(23, 23, 27), Stroke = Color3.fromRGB(50, 50, 57),
+    Accent = Color3.fromRGB(245, 245, 250), Text = Color3.fromRGB(240, 240, 245),
+    TextDim = Color3.fromRGB(148, 148, 158), Muted = Color3.fromRGB(98, 98, 108),
+    ButtonOn = Color3.fromRGB(244, 244, 248), ButtonOff = Color3.fromRGB(12, 12, 14),
+    Danger = Color3.fromRGB(255, 120, 120),
 }
 
+-- Único toque de color: el estado (para leerlo de un vistazo)
 local STATUS_COLORS = {
-    stopped = THEME.Muted, searching = THEME.Warning, attacking = THEME.Success,
-    dodging = THEME.Violet, waiting = THEME.Warning,
+    stopped = Color3.fromRGB(110, 110, 120), searching = Color3.fromRGB(255, 214, 125),
+    attacking = Color3.fromRGB(125, 255, 175), dodging = Color3.fromRGB(196, 176, 255),
+    waiting = Color3.fromRGB(255, 214, 125),
 }
 
 local TWEEN_FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local TWEEN_MEDIUM = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_SLOW = TweenInfo.new(0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local TWEEN_POP = TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+local TWEEN_OUT = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 local TWEEN_PULSE = TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
 
 local activeTweens = setmetatable({}, { __mode = "k" })
@@ -957,13 +973,45 @@ end
 local function makeButton(parent, properties)
     return create("TextButton", merge({ AutoButtonColor = false, BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0, Font = Enum.Font.GothamBold, Text = "", TextColor3 = THEME.Text, TextSize = 12 }, properties), parent)
 end
+
+-- Glow falso con capas de UIStroke (sin assets externos).
+-- specs = { {grosor, transparenciaBase}, ... }
+local function addGlow(parent, radius, color, specs)
+    local layers = {}
+    for _, spec in ipairs(specs) do
+        local frame = create("Frame", { Active = false, BackgroundTransparency = 1, BorderSizePixel = 0, Name = "Glow", Size = UDim2.fromScale(1, 1), ZIndex = 0 }, parent)
+        create("UICorner", { CornerRadius = UDim.new(0, radius) }, frame)
+        local stroke = outline(frame, color, spec[1])
+        stroke.Transparency = spec[2]
+        table.insert(layers, { stroke = stroke, base = spec[2] })
+    end
+    return layers
+end
+
+-- Ajusta la intensidad de un glow (level ~0..2, pulse 0..1)
+local function applyGlow(layers, level, pulse)
+    if not layers then return end
+    local factor = level * (0.65 + 0.35 * pulse)
+    for _, layer in ipairs(layers) do
+        layer.stroke.Transparency = math.clamp(1 - (1 - layer.base) * factor, 0, 1)
+    end
+end
+
+local function shade(color, hovering, pressed)
+    if pressed then return color:Lerp(BLACK, 0.15) end
+    if hovering then
+        local lum = color.R * 0.3 + color.G * 0.59 + color.B * 0.11
+        return color:Lerp(lum > 0.5 and BLACK or WHITE, 0.09)
+    end
+    return color
+end
+
 local function attachButtonFeedback(button, getBaseColor)
     local hovering, pressed = false, false
+    local scale = create("UIScale", { Scale = 1 }, button)
     local function apply()
-        local color = getBaseColor()
-        if pressed then color = color:Lerp(Color3.new(0,0,0), 0.15)
-        elseif hovering then color = color:Lerp(Color3.new(1,1,1), 0.1) end
-        tween(button, TWEEN_FAST, { BackgroundColor3 = color })
+        tween(button, TWEEN_FAST, { BackgroundColor3 = shade(getBaseColor(), hovering, pressed) })
+        tween(scale, TWEEN_FAST, { Scale = pressed and 0.95 or (hovering and 1.02 or 1) })
     end
     bind(button.MouseEnter, function() hovering = true; apply() end)
     bind(button.MouseLeave, function() hovering = false; pressed = false; apply() end)
@@ -989,10 +1037,13 @@ end
 -- ============================================================
 local function makeSectionHeader(parent, order, text, actionText, onAction)
     local row = create("Frame", { BackgroundTransparency = 1, LayoutOrder = order, Size = UDim2.new(1, 0, 0, 14) }, parent)
-    makeLabel(row, { Font = Enum.Font.GothamBold, Size = UDim2.new(0.6, 0, 1, 0), Text = text, TextColor3 = THEME.TextDim, TextSize = 10 })
+    local tick = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = WHITE, BorderSizePixel = 0, Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.fromOffset(2, 10) }, row)
+    round(tick, 1)
+    create("UIStroke", { Color = WHITE, Thickness = 2, Transparency = 0.85, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, tick)
+    makeLabel(row, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(8, 0), Size = UDim2.new(0.6, -8, 1, 0), Text = text, TextColor3 = THEME.TextDim, TextSize = 10 })
     if actionText then
-        local action = makeButton(row, { AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0.4, 0, 1, 0), Text = actionText, TextColor3 = THEME.Accent, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right })
-        attachTextHover(action, THEME.Accent, THEME.Text)
+        local action = makeButton(row, { AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0.4, 0, 1, 0), Text = actionText, TextColor3 = THEME.TextDim, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right })
+        attachTextHover(action, THEME.TextDim, WHITE)
         bind(action.Activated, onAction)
     end
     return row
@@ -1000,24 +1051,34 @@ end
 
 local function makeStat(parent, order, caption)
     local card = create("Frame", { BackgroundColor3 = THEME.Surface, BorderSizePixel = 0, LayoutOrder = order }, parent)
-    round(card, 10); outline(card)
+    round(card, 10)
+    local stroke = outline(card)
+    bind(card.MouseEnter, function() tween(stroke, TWEEN_FAST, { Color = Color3.fromRGB(150, 150, 160) }) end)
+    bind(card.MouseLeave, function() tween(stroke, TWEEN_FAST, { Color = THEME.Stroke }) end)
     local value = makeLabel(card, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 22), Text = "0", TextSize = 18 })
     makeLabel(card, { Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(10, 29), Size = UDim2.new(1, -20, 0, 14), Text = caption, TextColor3 = THEME.TextDim, TextSize = 10 })
     return value
 end
 
 local function makeChip(parent, order, text, key)
-    local function getBase() return Config[key] and THEME.AccentDark or THEME.SurfaceAlt end
+    local function getBase() return Config[key] and THEME.ButtonOn or THEME.SurfaceAlt end
     local chip = makeButton(parent, { BackgroundColor3 = getBase(), LayoutOrder = order, Name = key, Text = text, TextSize = 11 })
     round(chip, 8)
     local stroke = outline(chip)
+    local glow = addGlow(chip, 8, WHITE, { { 2, 1 }, { 4, 1 } })
     local feedback = attachButtonFeedback(chip, getBase)
+    local glowOn = { 0.68, 0.88 }
+
     local function render()
         local enabled = Config[key]
-        chip.TextColor3 = enabled and THEME.Text or THEME.TextDim
-        tween(stroke, TWEEN_FAST, { Color = enabled and THEME.Accent or THEME.Stroke })
+        TweenService:Create(chip, TWEEN_FAST, { TextColor3 = enabled and BLACK or THEME.TextDim }):Play()
+        tween(stroke, TWEEN_FAST, { Color = enabled and WHITE or THEME.Stroke })
+        for index, layer in ipairs(glow) do
+            tween(layer.stroke, TWEEN_MEDIUM, { Transparency = enabled and glowOn[index] or 1 })
+        end
         feedback()
     end
+    chip.TextColor3 = Config[key] and BLACK or THEME.TextDim
     render()
     bind(chip.Activated, function()
         Config[key] = not Config[key]
@@ -1031,11 +1092,12 @@ local function makeStepper(parent, order, labelText, key)
     local cell = create("Frame", { BackgroundTransparency = 1, LayoutOrder = order }, parent)
     makeLabel(cell, { Font = Enum.Font.GothamMedium, Size = UDim2.new(1, 0, 0, 14), Text = labelText, TextColor3 = THEME.TextDim, TextSize = 11 })
     local row = create("Frame", { BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0, Position = UDim2.fromOffset(0, 18), Size = UDim2.new(1, 0, 0, 28) }, cell)
-    round(row, 8); outline(row)
+    round(row, 8)
+    local rowStroke = outline(row)
     local minus = makeButton(row, { BackgroundTransparency = 1, Size = UDim2.fromOffset(28, 28), Text = "-", TextColor3 = THEME.TextDim, TextSize = 16 })
     local plus = makeButton(row, { AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Position = UDim2.new(1, 0, 0, 0), Size = UDim2.fromOffset(28, 28), Text = "+", TextColor3 = THEME.TextDim, TextSize = 16 })
     local box = create("TextBox", { BackgroundTransparency = 1, ClearTextOnFocus = false, Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -56, 1, 0), Text = formatNumber(Config[key]), TextColor3 = THEME.Text, TextSize = 13 }, row)
-    attachTextHover(minus, THEME.TextDim, THEME.Accent); attachTextHover(plus, THEME.TextDim, THEME.Accent)
+    attachTextHover(minus, THEME.TextDim, WHITE); attachTextHover(plus, THEME.TextDim, WHITE)
 
     local function apply(value)
         value = clampSetting(key, value)
@@ -1045,7 +1107,9 @@ local function makeStepper(parent, order, labelText, key)
     end
     bind(minus.Activated, function() apply(Config[key] - limit.step) end)
     bind(plus.Activated, function() apply(Config[key] + limit.step) end)
+    bind(box.Focused, function() tween(rowStroke, TWEEN_FAST, { Color = WHITE }) end)
     bind(box.FocusLost, function()
+        tween(rowStroke, TWEEN_FAST, { Color = THEME.Stroke })
         local value = tonumber(box.Text)
         if value then apply(value) else box.Text = formatNumber(Config[key]) end
     end)
@@ -1080,47 +1144,87 @@ end
 -- UI: VENTANA PRINCIPAL
 -- ============================================================
 local function buildUI()
+    ui.loops = {}
+    ui.glowLevel = 0.5
+    ui.btnLevel = 0.55
+    ui.introFlare = 1.2
+
     local viewport = getViewport()
     local width = math.clamp(viewport.X - 24, 260, WINDOW_WIDTH)
     local gui = create("ScreenGui", { DisplayOrder = 50, IgnoreGuiInset = true, Name = GUI_NAME, ResetOnSpawn = false, ZIndexBehavior = Enum.ZIndexBehavior.Sibling }, PlayerGui)
     ui.gui = gui
 
-    local window = create("Frame", { Active = true, AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = THEME.Background, BorderSizePixel = 0, Name = "Window", Position = UDim2.fromOffset(math.floor((viewport.X - width) / 2), math.floor(viewport.Y * 0.12)), Size = UDim2.fromOffset(width, HEADER_HEIGHT) }, gui)
-    round(window, 12)
-    local border = outline(window, Color3.new(1, 1, 1), 1.5)
-    create("UIGradient", { Color = ColorSequence.new(THEME.Accent, THEME.Violet), Rotation = 45 }, border)
+    -- Contenedor (lleva posición, escala y glow exterior)
+    local shell = create("Frame", { AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, Name = "Shell", Position = UDim2.fromOffset(math.floor((viewport.X - width) / 2), math.floor(viewport.Y * 0.12)), Size = UDim2.fromOffset(width, HEADER_HEIGHT) }, gui)
+    ui.window = shell
+    ui.scale = create("UIScale", { Scale = 0.86 }, shell)
+    ui.windowGlow = addGlow(shell, 14, WHITE, { { 2, 0.6 }, { 5, 0.8 }, { 9, 0.9 }, { 14, 0.95 }, { 20, 0.98 } })
+
+    local window = create("Frame", { Active = true, AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = THEME.Background, BorderSizePixel = 0, Name = "Window", Size = UDim2.new(1, 0, 0, HEADER_HEIGHT), ZIndex = 2 }, shell)
+    round(window, 14)
+    create("UIGradient", { Color = ColorSequence.new(Color3.fromRGB(20, 20, 24), Color3.fromRGB(5, 5, 6)), Rotation = 90 }, window)
+    local border = outline(window, WHITE, 1.5)
+    ui.borderGradient = create("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, WHITE),
+            ColorSequenceKeypoint.new(0.3, Color3.fromRGB(55, 55, 62)),
+            ColorSequenceKeypoint.new(0.5, WHITE),
+            ColorSequenceKeypoint.new(0.7, Color3.fromRGB(55, 55, 62)),
+            ColorSequenceKeypoint.new(1, WHITE),
+        }),
+    }, border)
     create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, window)
-    ui.window = window
 
+    -- Encabezado
     local header = create("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1, Name = "Header", Size = UDim2.new(1, 0, 0, HEADER_HEIGHT) }, window)
-    makeLabel(header, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(14, 7), Size = UDim2.new(1, -90, 0, 18), Text = "⚔️ Fabled Autofarm", TextSize = 15 })
-    makeLabel(header, { Position = UDim2.fromOffset(14, 25), Size = UDim2.new(1, -90, 0, 14), Text = "Smart Dodge · v" .. VERSION, TextColor3 = THEME.TextDim, TextSize = 11 })
-    create("Frame", { BackgroundColor3 = THEME.Stroke, BorderSizePixel = 0, Name = "Divider", Position = UDim2.new(0, 12, 1, -1), Size = UDim2.new(1, -24, 0, 1) }, header)
+    local title = makeLabel(header, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(16, 8), Size = UDim2.new(1, -100, 0, 18), Text = "⚔️ Fabled Autofarm", TextSize = 15 })
+    ui.titleStroke = create("UIStroke", { Color = WHITE, Thickness = 1.5, Transparency = 0.8 }, title)
+    makeLabel(header, { Position = UDim2.fromOffset(16, 27), Size = UDim2.new(1, -100, 0, 14), Text = "Noir Edition · v" .. VERSION, TextColor3 = THEME.TextDim, TextSize = 11 })
 
-    local minimizeButton = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Name = "Minimize", Position = UDim2.new(1, -42, 0.5, 0), Size = UDim2.fromOffset(26, 26), Text = "-", TextSize = 16 })
-    round(minimizeButton, 8); attachButtonFeedback(minimizeButton, function() return THEME.SurfaceAlt end)
-    local closeButton = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Name = "Close", Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(26, 26), Text = "×", TextSize = 18 })
-    round(closeButton, 8); attachButtonFeedback(closeButton, function() return THEME.SurfaceAlt end)
+    create("Frame", { BackgroundColor3 = THEME.Stroke, BorderSizePixel = 0, Name = "Divider", Position = UDim2.new(0, 12, 1, -1), Size = UDim2.new(1, -24, 0, 1) }, header)
+    local shimmerLine = create("Frame", { BackgroundColor3 = WHITE, BorderSizePixel = 0, Name = "Shimmer", Position = UDim2.new(0, 12, 1, -1), Size = UDim2.new(1, -24, 0, 1) }, header)
+    local shimmerGradient = create("UIGradient", {
+        Offset = Vector2.new(-1, 0),
+        Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.05), NumberSequenceKeypoint.new(1, 1) }),
+    }, shimmerLine)
+    local shimmerTween = TweenService:Create(shimmerGradient, TweenInfo.new(2.4, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1), { Offset = Vector2.new(1, 0) })
+    shimmerTween:Play()
+    table.insert(ui.loops, shimmerTween)
+
+    local minimizeButton = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Name = "Minimize", Position = UDim2.new(1, -44, 0.5, 0), Size = UDim2.fromOffset(26, 26), Text = "-", TextSize = 16 })
+    round(minimizeButton, 8); outline(minimizeButton); attachButtonFeedback(minimizeButton, function() return THEME.SurfaceAlt end)
+    local closeButton = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Name = "Close", Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(26, 26), Text = "×", TextSize = 18 })
+    round(closeButton, 8); outline(closeButton); attachButtonFeedback(closeButton, function() return THEME.SurfaceAlt end)
+    attachTextHover(closeButton, THEME.Text, THEME.Danger)
     ui.minimizeButton = minimizeButton
 
-    local body = create("ScrollingFrame", { AutomaticCanvasSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(), ElasticBehavior = Enum.ElasticBehavior.Never, LayoutOrder = 2, Name = "Body", ScrollBarImageColor3 = THEME.Stroke, ScrollBarThickness = 3, ScrollingDirection = Enum.ScrollingDirection.Y, Size = UDim2.new(1, 0, 0, 0) }, window)
+    -- Cuerpo
+    local body = create("ScrollingFrame", { AutomaticCanvasSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(), ElasticBehavior = Enum.ElasticBehavior.Never, LayoutOrder = 2, Name = "Body", ScrollBarImageColor3 = Color3.fromRGB(120, 120, 130), ScrollBarThickness = 3, ScrollingDirection = Enum.ScrollingDirection.Y, Size = UDim2.new(1, 0, 0, 0) }, window)
     pad(body, 10, 12, 12, 12)
     local list = create("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, body)
     ui.body = body; ui.list = list
 
+    -- Estado
     local statusRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 1, Name = "StatusRow", Size = UDim2.new(1, 0, 0, 18) }, body)
-    local dot = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = STATUS_COLORS.stopped, BorderSizePixel = 0, Name = "Dot", Position = UDim2.new(0, 2, 0.5, 0), Size = UDim2.fromOffset(10, 10) }, statusRow)
+    local dot = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = STATUS_COLORS.stopped, BorderSizePixel = 0, Name = "Dot", Position = UDim2.new(0, 4, 0.5, 0), Size = UDim2.fromOffset(9, 9) }, statusRow)
     round(dot, 5)
+    ui.dotStroke = create("UIStroke", { ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Color = STATUS_COLORS.stopped, Thickness = 4, Transparency = 0.85 }, dot)
     ui.statusDot = dot
     ui.pulse = TweenService:Create(dot, TWEEN_PULSE, { BackgroundTransparency = 0.6 })
-    ui.statusLabel = makeLabel(statusRow, { Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(20, 0), Size = UDim2.new(1, -20, 1, 0), Text = State.status })
+    ui.statusLabel = makeLabel(statusRow, { Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -22, 1, 0), Text = State.status })
 
-    local mainButton = makeButton(body, { BackgroundColor3 = THEME.SuccessButton, LayoutOrder = 2, Name = "ToggleButton", Size = UDim2.new(1, 0, 0, 40), Text = "INICIAR AUTOFARM", TextSize = 14 })
+    -- Botón principal con glow propio
+    local mainWrap = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 2, Name = "ToggleWrap", Size = UDim2.new(1, 0, 0, 42) }, body)
+    ui.buttonGlow = addGlow(mainWrap, 10, WHITE, { { 2, 0.55 }, { 5, 0.78 }, { 8, 0.9 } })
+    local mainButton = makeButton(mainWrap, { BackgroundColor3 = THEME.ButtonOn, Name = "ToggleButton", Size = UDim2.fromScale(1, 1), Text = "INICIAR AUTOFARM", TextColor3 = BLACK, TextSize = 14, ZIndex = 2 })
     round(mainButton, 10)
+    ui.mainStroke = outline(mainButton, WHITE, 1.5)
+    ui.mainStroke.Transparency = 1
     ui.mainButton = mainButton
-    ui.mainFeedback = attachButtonFeedback(mainButton, function() return State.running and THEME.DangerButton or THEME.SuccessButton end)
+    ui.mainFeedback = attachButtonFeedback(mainButton, function() return State.running and THEME.ButtonOff or THEME.ButtonOn end)
     bind(mainButton.Activated, toggleFarm)
 
+    -- Objetivo
     local card = create("Frame", { BackgroundColor3 = THEME.Surface, BorderSizePixel = 0, LayoutOrder = 3, Name = "TargetCard", Size = UDim2.new(1, 0, 0, 62) }, body)
     round(card, 10); outline(card)
     makeLabel(card, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(10, 8), Size = UDim2.new(0.5, -10, 0, 12), Text = "OBJETIVO", TextColor3 = THEME.TextDim, TextSize = 10 })
@@ -1129,9 +1233,11 @@ local function buildUI()
     ui.targetHp = makeLabel(card, { AnchorPoint = Vector2.new(1, 0), Font = Enum.Font.Code, Position = UDim2.new(1, -10, 0, 23), Size = UDim2.fromOffset(44, 16), Text = "", TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Right })
     local hpTrack = create("Frame", { BackgroundColor3 = THEME.SurfaceAlt, BorderSizePixel = 0, Name = "HpTrack", Position = UDim2.new(0, 10, 0, 46), Size = UDim2.new(1, -20, 0, 8) }, card)
     round(hpTrack, 4)
-    ui.hpFill = create("Frame", { BackgroundColor3 = THEME.Success, BorderSizePixel = 0, Name = "HpFill", Size = UDim2.fromScale(0, 1) }, hpTrack)
+    ui.hpFill = create("Frame", { BackgroundColor3 = WHITE, BorderSizePixel = 0, Name = "HpFill", Size = UDim2.fromScale(0, 1) }, hpTrack)
     round(ui.hpFill, 4)
+    ui.hpGlow = create("UIStroke", { ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Color = WHITE, Enabled = false, Thickness = 3, Transparency = 0.78 }, ui.hpFill)
 
+    -- Estadísticas
     makeSectionHeader(body, 4, "ESTADÍSTICAS", "Reiniciar", resetStats)
     local statsRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 5, Name = "Stats", Size = UDim2.new(1, 0, 0, 50) }, body)
     create("UIGridLayout", { CellPadding = UDim2.fromOffset(9, 0), CellSize = UDim2.new(1 / 3, -6, 1, 0), SortOrder = Enum.SortOrder.LayoutOrder }, statsRow)
@@ -1139,6 +1245,7 @@ local function buildUI()
     ui.timeLabel = makeStat(statsRow, 2, "TIEMPO")
     ui.kpmLabel = makeStat(statsRow, 3, "KILLS/MIN")
 
+    -- Combate
     makeSectionHeader(body, 6, "COMBATE", "Borrar aprendido", resetLearned)
     local chipsRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 7, Name = "Chips", Size = UDim2.new(1, 0, 0, 66) }, body)
     create("UIGridLayout", { CellPadding = UDim2.fromOffset(6, 6), CellSize = UDim2.new(0.25, -5, 0, 30), SortOrder = Enum.SortOrder.LayoutOrder }, chipsRow)
@@ -1149,9 +1256,11 @@ local function buildUI()
     makeChip(chipsRow, 5, "Start", "AutoStart")
     makeChip(chipsRow, 6, "Anti-AFK", "AntiAFK")
     makeChip(chipsRow, 7, "Atk+Esq", "AttackWhileDodging")
+    makeChip(chipsRow, 8, "Auto-iniciar", "AutoRun")
 
     ui.dodgeInfo = makeLabel(body, { LayoutOrder = 8, Name = "DodgeInfo", Size = UDim2.new(1, 0, 0, 14), Text = "", TextColor3 = THEME.TextDim, TextSize = 10 })
 
+    -- Ajustes
     makeSectionHeader(body, 9, "AJUSTES")
     local grid = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 10, Name = "Settings", Size = UDim2.new(1, 0, 0, 4 * 46 + 3 * 6) }, body)
     create("UIGridLayout", { CellPadding = UDim2.fromOffset(8, 6), CellSize = UDim2.new(0.5, -4, 0, 46), SortOrder = Enum.SortOrder.LayoutOrder }, grid)
@@ -1165,8 +1274,8 @@ local function buildUI()
 
     makeLabel(body, { LayoutOrder = 11, Name = "Footer", Size = UDim2.new(1, 0, 0, 14), Text = HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener  ·  " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI", TextColor3 = THEME.Muted, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center })
 
-    makeDraggable(header, window)
-    bind(closeButton.Activated, unload)
+    makeDraggable(header, shell)
+    bind(closeButton.Activated, function() ui.close() end)
     bind(minimizeButton.Activated, function()
         State.minimized = not State.minimized
         minimizeButton.Text = State.minimized and "+" or "-"
@@ -1175,6 +1284,9 @@ local function buildUI()
     bind(list:GetPropertyChangedSignal("AbsoluteContentSize"), function() ui.relayout(false) end)
     local camera = workspace.CurrentCamera
     if camera then bind(camera:GetPropertyChangedSignal("ViewportSize"), function() ui.relayout(false) end) end
+
+    -- Animación de entrada
+    tween(ui.scale, TWEEN_POP, { Scale = 1 })
 end
 
 function ui.relayout(animated)
@@ -1186,12 +1298,60 @@ function ui.relayout(animated)
     local size = UDim2.new(1, 0, 0, height)
     if not State.minimized then body.Visible = true end
     if animated then
-        local sizeTween = tween(body, TWEEN_MEDIUM, { Size = size })
+        local sizeTween = tween(body, TWEEN_SLOW, { Size = size })
         if State.minimized then sizeTween.Completed:Once(function() if State.minimized then body.Visible = false end end) end
     else
         body.Size = size
         body.Visible = not State.minimized
     end
+end
+
+-- Cerrar con animación
+function ui.close()
+    if ui.closing or not ui.scale then return end
+    ui.closing = true
+    tween(ui.scale, TWEEN_OUT, { Scale = 0.82 })
+    task.delay(0.19, unload)
+end
+
+-- Ocultar / mostrar con animación (RightShift)
+function ui.toggleVisible()
+    local gui = ui.gui
+    if not gui or ui.closing then return end
+    if gui.Enabled and not ui.hidden then
+        ui.hidden = true
+        local hideTween = tween(ui.scale, TWEEN_OUT, { Scale = 0.88 })
+        hideTween.Completed:Once(function()
+            if ui.hidden and ui.gui then ui.gui.Enabled = false end
+        end)
+    else
+        ui.hidden = false
+        gui.Enabled = true
+        ui.scale.Scale = 0.88
+        ui.introFlare = 0.8
+        tween(ui.scale, TWEEN_POP, { Scale = 1 })
+    end
+end
+
+-- Animación continua (cada frame): glow que respira, borde giratorio
+function ui.animate(dt)
+    local gui = ui.gui
+    if not gui or not gui.Parent or not gui.Enabled or not ui.windowGlow then return end
+    local t = os.clock()
+    local pulse = 0.5 + 0.5 * math.sin(t * 2.2)
+    local running = State.running
+    local blend = math.min(dt * 4, 1)
+
+    ui.glowLevel = ui.glowLevel + ((running and 1 or 0.5) - ui.glowLevel) * blend
+    ui.btnLevel = ui.btnLevel + ((running and 1.15 or 0.6) - ui.btnLevel) * blend
+    ui.introFlare = math.max(0, ui.introFlare - dt * 1.1)
+
+    applyGlow(ui.windowGlow, ui.glowLevel + ui.introFlare, pulse)
+    applyGlow(ui.buttonGlow, ui.btnLevel, 1 - pulse)
+
+    ui.borderGradient.Rotation = (t * 45) % 360
+    ui.titleStroke.Transparency = 0.9 - 0.25 * pulse
+    ui.dotStroke.Transparency = running and (0.45 + 0.4 * pulse) or 0.88
 end
 
 function ui.refresh()
@@ -1202,19 +1362,27 @@ function ui.refresh()
         if running ~= ui.shownRunning then
             ui.shownRunning = running
             ui.mainButton.Text = running and "DETENER AUTOFARM" or "INICIAR AUTOFARM"
+            TweenService:Create(ui.mainButton, TWEEN_MEDIUM, { TextColor3 = running and WHITE or BLACK }):Play()
+            tween(ui.mainStroke, TWEEN_MEDIUM, { Transparency = running and 0 or 1 })
             ui.mainFeedback()
             if running then ui.pulse:Play() else ui.pulse:Cancel(); ui.statusDot.BackgroundTransparency = 0 end
         end
         local kind = State.statusKind
         if kind ~= ui.shownKind then
             ui.shownKind = kind
-            tween(ui.statusDot, TWEEN_FAST, { BackgroundColor3 = STATUS_COLORS[kind] })
+            local color = STATUS_COLORS[kind]
+            tween(ui.statusDot, TWEEN_FAST, { BackgroundColor3 = color })
+            TweenService:Create(ui.dotStroke, TWEEN_FAST, { Color = color }):Play()
         end
-        setText(ui.statusLabel, State.status)
+        if ui.statusLabel.Text ~= State.status then
+            ui.statusLabel.Text = State.status
+            ui.statusLabel.TextTransparency = 0.7
+            tween(ui.statusLabel, TWEEN_MEDIUM, { TextTransparency = 0 })
+        end
 
         local name = "Ninguno"
         local nameColor = THEME.TextDim
-        local fraction, percentText, fillColor = 0, "", THEME.Success
+        local fraction, percentText, fillColor = 0, "", WHITE
 
         local target = State.target
         if target then
@@ -1223,9 +1391,9 @@ function ui.refresh()
             if humanoid and humanoid.Parent then
                 fraction = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
                 percentText = string.format("%d%%", math.floor(fraction * 100 + 0.5))
-                fillColor = Color3.fromHSV(fraction * 0.33, 0.75, 0.95)
+                fillColor = fraction < 0.3 and WHITE:Lerp(THEME.Danger, 1 - fraction / 0.3) or WHITE
             else
-                fraction = 1; percentText = "--"; fillColor = THEME.Accent
+                fraction = 1; percentText = "--"; fillColor = Color3.fromRGB(190, 190, 200)
             end
         elseif running then name = "Sin objetivo · muévete por la mazmorra" end
 
@@ -1234,8 +1402,9 @@ function ui.refresh()
         setText(ui.targetHp, percentText)
         if fraction ~= ui.shownFraction then
             ui.shownFraction = fraction
-            ui.hpFill.Size = UDim2.fromScale(fraction, 1)
-            ui.hpFill.BackgroundColor3 = fillColor
+            ui.hpGlow.Enabled = fraction > 0.02
+            ui.hpGlow.Color = fillColor
+            tween(ui.hpFill, TWEEN_MEDIUM, { Size = UDim2.fromScale(fraction, 1), BackgroundColor3 = fillColor })
         end
         setText(ui.candidatesLabel, State.candidates == 1 and "1 candidato" or (State.candidates .. " candidatos"))
         setText(ui.killsLabel, tostring(State.kills))
@@ -1266,6 +1435,7 @@ bind(RunService.Heartbeat, function(dt)
         end
         uiClock = uiClock + dt
         if uiClock >= UI_REFRESH_INTERVAL then uiClock = 0; ui.refresh() end
+        ui.animate(dt)
     end)
 end)
 
@@ -1274,7 +1444,7 @@ bind(UserInputService.InputBegan, function(input, gameProcessed)
     if input.KeyCode == HOTKEY_TOGGLE_FARM then
         toggleFarm()
     elseif input.KeyCode == HOTKEY_TOGGLE_UI and ui.gui then
-        ui.gui.Enabled = not ui.gui.Enabled
+        ui.toggleVisible()
     end
 end)
 
@@ -1292,5 +1462,14 @@ if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) 
 
 sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload }
 
+-- AUTO-INICIO: arranca el autofarm solo (desactivable con el chip "Auto-iniciar")
+if Config.AutoRun then
+    task.defer(function()
+        startFarm()
+        ui.refresh()
+    end)
+end
+
 ui.refresh()
-print(string.format("✅ Fabled Autofarm v%s (Smart Dodge) cargado · %s: iniciar/detener · %s: ocultar UI", VERSION, HOTKEY_TOGGLE_FARM.Name, HOTKEY_TOGGLE_UI.Name))
+print(string.format("✅ Fabled Autofarm v%s (Noir Edition) cargado%s · %s: iniciar/detener · %s: ocultar UI",
+    VERSION, Config.AutoRun and " · AUTO-INICIADO" or "", HOTKEY_TOGGLE_FARM.Name, HOTKEY_TOGGLE_UI.Name))
