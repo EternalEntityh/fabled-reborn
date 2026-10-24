@@ -1,14 +1,24 @@
 --[[
-    ⚔️ FABLED AUTOFARM (Universal) — v3.0 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.1 (Noir Edition)
 
-    NOVEDADES v3.0
-    • AUTO-INICIO: el autofarm arranca solo al ejecutar el script
-      (chip "Auto-iniciar" para desactivarlo; se guarda en tu config).
-    • UI nueva en negro y blanco con glows animados:
-      borde con brillo giratorio, resplandor que "respira", destello de
-      entrada, rebote en botones, chips con glow, barra de vida suave,
-      línea de brillo que recorre el encabezado y animación al cerrar/ocultar.
-    • Toda la lógica de combate / esquiva inteligente de v2.9 se mantiene intacta.
+    NOVEDADES v3.1
+    • Sin emoji de espadas en el título.
+    • AUTO-START MÓVIL: detecta el botón START en más variantes (texto, nombre,
+      ImageButton con texto dentro), reacciona al instante cuando aparece una UI
+      nueva, dispara las conexiones del botón directamente (sin depender de
+      coordenadas) y, si hace falta, usa toques reales (SendTouchEvent) con
+      corrección automática del GuiInset, además de selección por GuiService.
+    • DETECCIÓN DE ENEMIGOS MEJORADA:
+        - Registro por eventos: cualquier Humanoid nuevo en el workspace se evalúa
+          al aparecer (no depende de carpetas conocidas).
+        - Dentro de carpetas de enemigos se aceptan enemigos de poca vida
+          (antes se ignoraba todo con menos de 500 de vida máxima).
+        - El filtro de "props" ya no descarta enemigos con nombres como
+          "Fire Elemental" o "Light Knight" (solo se aplica a modelos sin Humanoid).
+        - Ya no se descartan enemigos por estar dentro de una carpeta llamada "...Map".
+        - Escaneo recursivo también dentro de modelos-grupo en las carpetas de enemigos.
+        - Escaneo más frecuente y parte objetivo con más respaldos (PrimaryPart).
+    • Toda la lógica de combate / esquiva inteligente se mantiene intacta.
 
     Atajos:  RightControl = iniciar / detener  ·  RightShift = ocultar / mostrar UI
 ]]
@@ -34,8 +44,9 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.0"
+local VERSION = "3.1"
 local GUI_NAME = "FabledAutofarmUI"
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 local sharedEnv = (typeof(getgenv) == "function" and getgenv()) or _G
 if type(sharedEnv.FabledAutofarm) == "table" and type(sharedEnv.FabledAutofarm.Unload) == "function" then
@@ -52,11 +63,12 @@ end
 local KEY_HOLD_TIME = 0.01
 local KEY_GAP_TIME = 0.01
 local CLICK_X, CLICK_Y = 0, 0
-local SCAN_INTERVAL = 0.5
-local IDLE_SCAN_INTERVAL = 0.5
-local WORKSPACE_FALLBACK_INTERVAL = 2
-local MAX_SCAN_DEPTH = 6
-local MIN_ENEMY_MAX_HEALTH = 500
+local SCAN_INTERVAL = 0.35
+local IDLE_SCAN_INTERVAL = 0.3
+local WORKSPACE_FALLBACK_INTERVAL = 3
+local MAX_SCAN_DEPTH = 7
+local MIN_ENEMY_MAX_HEALTH = 500       -- fuera de carpetas de enemigos
+local MIN_FOLDER_ENEMY_HEALTH = 0      -- dentro de carpetas de enemigos (cualquier vida > 0)
 local UI_REFRESH_INTERVAL = 0.1
 local TARGET_STICKY_DISTANCE = 12      -- el objetivo actual se conserva si otro no está al menos 12 studs más cerca
 
@@ -90,7 +102,7 @@ local DEFAULTS = {
     UseSkillR = true,
     UseClick = true,
     AutoStart = true,      -- pulsa el botón START del juego
-    AutoRun = true,        -- NUEVO: inicia el autofarm solo al ejecutar el script
+    AutoRun = true,        -- inicia el autofarm solo al ejecutar el script
     AntiAFK = true,
 }
 
@@ -152,12 +164,14 @@ loadConfig()
 -- ============================================================
 -- LISTAS DE FILTRADO
 -- ============================================================
+-- Nombres exactos de NPCs / cosas que NUNCA son enemigos
 local NAME_BLACKLIST = {
     "stranger", "geoff", "buy bundle", "level milestone", "speedrun leaderboard",
     "change lobby music", "check runs", "promptpart", "wishing well", "sirpixel",
     "healer", "companion", "healercompanion", "dummy", "training", "spawnpoint",
 }
 
+-- Solo se aplica a modelos SIN Humanoid válido (los que se detectan por la parte "Circle")
 local PROP_BLACKLIST = {
     "torch", "torck", "light", "lamp", "fire", "candle", "particle", "effect",
     "prop", "decor", "model", "map", "terrain", "wall", "floor", "door",
@@ -167,6 +181,11 @@ local PROP_BLACKLIST = {
 local ENEMY_FOLDERS = {
     "Enemies", "Bosses", "Boss", "DungeonMap", "Mobs", "Monsters", "WaveEnemies",
 }
+
+local ENEMY_FOLDER_SET = {}
+for _, folderName in ipairs(ENEMY_FOLDERS) do
+    ENEMY_FOLDER_SET[string.lower(folderName)] = true
+end
 
 -- ============================================================
 -- ESTADO COMPARTIDO
@@ -196,23 +215,42 @@ end
 -- ============================================================
 -- DETECCIÓN DE ENEMIGOS
 -- ============================================================
-local blockedNameCache = {}
+local npcNameCache = {}
+local propNameCache = {}
 
-local function isBlockedName(name)
-    local cached = blockedNameCache[name]
-    if cached ~= nil then return cached end
+local function matchesList(name, list)
     local lowered = string.lower(name)
-    local blocked = false
-    for _, word in ipairs(NAME_BLACKLIST) do
-        if string.find(lowered, word, 1, true) then blocked = true; break end
+    for _, word in ipairs(list) do
+        if string.find(lowered, word, 1, true) then return true end
     end
-    if not blocked then
-        for _, word in ipairs(PROP_BLACKLIST) do
-            if string.find(lowered, word, 1, true) then blocked = true; break end
-        end
+    return false
+end
+
+local function isNpcName(name)
+    local cached = npcNameCache[name]
+    if cached == nil then
+        cached = matchesList(name, NAME_BLACKLIST)
+        npcNameCache[name] = cached
     end
-    blockedNameCache[name] = blocked
-    return blocked
+    return cached
+end
+
+local function isPropName(name)
+    local cached = propNameCache[name]
+    if cached == nil then
+        cached = matchesList(name, PROP_BLACKLIST)
+        propNameCache[name] = cached
+    end
+    return cached
+end
+
+local function isInEnemyFolder(model)
+    local node = model.Parent
+    while node and node ~= workspace and node ~= game do
+        if ENEMY_FOLDER_SET[string.lower(node.Name)] then return true end
+        node = node.Parent
+    end
+    return false
 end
 
 local function getEnemyPart(model)
@@ -222,36 +260,72 @@ local function getEnemyPart(model)
     if head and head:IsA("BasePart") then return head end
     local rootPart = model:FindFirstChild("HumanoidRootPart")
     if rootPart and rootPart:IsA("BasePart") then return rootPart end
-    return model:FindFirstChildWhichIsA("BasePart")
+    local primary = model.PrimaryPart
+    if primary and primary:IsA("BasePart") then return primary end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.RootPart then return humanoid.RootPart end
+    return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
 local function isEnemy(model)
     if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false end
-    if isBlockedName(model.Name) then return false end
+    if isNpcName(model.Name) then return false end
     local parent = model.Parent
-    if parent and isBlockedName(parent.Name) then return false end
+    if parent and parent ~= workspace and isNpcName(parent.Name) then return false end
 
     local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if humanoid and humanoid.Health > 0 and humanoid.MaxHealth > MIN_ENEMY_MAX_HEALTH then return true end
+    if humanoid then
+        if humanoid.Health <= 0 then return false end
+        local minHealth = isInEnemyFolder(model) and MIN_FOLDER_ENEMY_HEALTH or MIN_ENEMY_MAX_HEALTH
+        if humanoid.MaxHealth > minHealth then return true end
+    end
+
+    -- Enemigos sin Humanoid válido: se detectan por la parte "Circle"
     local circle = model:FindFirstChild("Circle")
-    return circle ~= nil and circle:IsA("BasePart")
+    if circle and circle:IsA("BasePart") and not isPropName(model.Name) then return true end
+    return false
 end
 
-local function scanContainer(container, depth, found, origin)
+-- Registro por eventos: todo Humanoid que aparezca en el workspace se evalúa solo
+local registry = setmetatable({}, { __mode = "k" })
+
+local function considerModel(model)
+    if not model or not model:IsA("Model") or not model.Parent then return end
+    if isEnemy(model) then registry[model] = true end
+end
+
+local function onWorkspaceDescendant(descendant)
+    if descendant:IsA("Humanoid") then
+        local model = descendant.Parent
+        -- pequeña espera: el modelo puede terminar de cargar sus partes después
+        task.delay(0.35, considerModel, model)
+    end
+end
+
+local function addFound(found, seen, model, origin)
+    if seen[model] then return end
+    local part = getEnemyPart(model)
+    if not part then return end
+    local dist = (part.Position - origin).Magnitude
+    if dist <= Config.ScanRadius then
+        seen[model] = true
+        table.insert(found, { model = model, part = part, dist = dist })
+    end
+end
+
+-- deep = true: también entra a modelos-grupo que no son enemigos (solo en carpetas de enemigos)
+local function scanContainer(container, depth, found, seen, origin, deep)
     if depth > MAX_SCAN_DEPTH then return end
     for _, object in ipairs(container:GetChildren()) do
         if object:IsA("Model") then
             if isEnemy(object) then
-                local part = getEnemyPart(object)
-                if part then
-                    local dist = (part.Position - origin).Magnitude
-                    if dist <= Config.ScanRadius then
-                        table.insert(found, { model = object, part = part, dist = dist })
-                    end
-                end
+                addFound(found, seen, object, origin)
+            elseif deep and not object:FindFirstChildOfClass("Humanoid")
+                and not Players:GetPlayerFromCharacter(object) then
+                scanContainer(object, depth + 1, found, seen, origin, deep)
             end
         elseif object:IsA("Folder") then
-            scanContainer(object, depth + 1, found, origin)
+            scanContainer(object, depth + 1, found, seen, origin, deep)
         end
     end
 end
@@ -280,15 +354,24 @@ local function refreshCandidates(origin)
     end
 
     cache.time = now
-    local found = {}
+    local found, seen = {}, {}
     for _, folderName in ipairs(ENEMY_FOLDERS) do
         local folder = workspace:FindFirstChild(folderName)
-        if folder then scanContainer(folder, 0, found, origin) end
+        if folder then scanContainer(folder, 0, found, seen, origin, true) end
+    end
+
+    -- Registro por eventos (enemigos fuera de carpetas conocidas)
+    for model in pairs(registry) do
+        if model.Parent then
+            if isEnemy(model) then addFound(found, seen, model, origin) end
+        else
+            registry[model] = nil
+        end
     end
 
     if #found == 0 and now - (cache.fullTime or 0) >= WORKSPACE_FALLBACK_INTERVAL then
         cache.fullTime = now
-        scanContainer(workspace, 0, found, origin)
+        scanContainer(workspace, 0, found, seen, origin, false)
     end
     cache.list = found
 end
@@ -312,6 +395,21 @@ local function findClosestEnemy(origin)
     return nil, nil, 0
 end
 
+-- Población inicial del registro + eventos (se hace una vez, cediendo el hilo)
+local function startEnemyRegistry()
+    bind(workspace.DescendantAdded, onWorkspaceDescendant)
+    task.spawn(function()
+        local count = 0
+        for _, descendant in ipairs(workspace:GetDescendants()) do
+            if descendant:IsA("Humanoid") then
+                considerModel(descendant.Parent)
+            end
+            count = count + 1
+            if count % 500 == 0 then task.wait() end
+        end
+    end)
+end
+
 -- ============================================================
 -- SIMULACIÓN DE ENTRADAS
 -- ============================================================
@@ -332,12 +430,22 @@ local function clickMouse()
 end
 
 -- ============================================================
--- AUTO-START (botón START del juego)
+-- AUTO-START (botón START del juego) — optimizado para móvil
 -- ============================================================
-local START_SCAN_INTERVAL = 3
-local START_RETRY_INTERVAL = 1.5
-local START_NAMES = { start = true, startbutton = true, startbtn = true, btnstart = true, startgame = true }
-local StartButton = { cache = nil, lastScan = 0, lastPress = 0, attempts = 0, giveUpUntil = 0 }
+local START_SCAN_INTERVAL = 2          -- escaneo normal
+local START_SCAN_FAST = 0.6            -- escaneo rápido cuando aparece UI nueva
+local START_RETRY_INTERVAL = 1.2
+local START_MAX_ATTEMPTS = 9
+local START_GIVE_UP = 6
+local START_NAMES = {
+    start = true, startbutton = true, startbtn = true, btnstart = true, startgame = true,
+    startdungeon = true, startrun = true, playbutton = true, playbtn = true,
+}
+local START_TEXTS = {
+    ["start"] = true, ["start game"] = true, ["start dungeon"] = true, ["start run"] = true,
+    ["iniciar"] = true, ["empezar"] = true, ["comenzar"] = true,
+}
+local StartButton = { cache = nil, lastScan = 0, lastPress = 0, attempts = 0, giveUpUntil = 0, dirty = false }
 
 local function cleanText(text)
     text = string.gsub(text, "<[^>]->", "")
@@ -353,8 +461,14 @@ local function isShown(obj)
         if current:IsA("ScreenGui") and not current.Enabled then return false end
         current = current.Parent
     end
+    if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.TextTransparency >= 0.95 and obj.BackgroundTransparency >= 0.95 then
+        return false
+    end
     local size = obj.AbsoluteSize
-    return size.X > 2 and size.Y > 2
+    if size.X <= 2 or size.Y <= 2 then return false end
+    local pos = obj.AbsolutePosition
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+    return pos.X + size.X > 0 and pos.Y + size.Y > 0 and pos.X < viewport.X and pos.Y < viewport.Y
 end
 
 local function containsPoint(gui, point)
@@ -367,7 +481,7 @@ local function resolveClickable(obj)
     if obj:IsA("GuiButton") then return obj end
     local center = obj.AbsolutePosition + obj.AbsoluteSize / 2
     local node = obj
-    for _ = 1, 3 do
+    for _ = 1, 4 do
         node = node.Parent
         if not node or node == PlayerGui then break end
         if node:IsA("GuiButton") then return node end
@@ -386,7 +500,7 @@ local function findStartButton()
         if screen ~= ui.gui and screen:IsA("ScreenGui") and screen.Enabled then
             for _, obj in ipairs(screen:GetDescendants()) do
                 scanned = scanned + 1
-                if scanned % 150 == 0 then
+                if scanned % 120 == 0 then
                     task.wait()
                 end
 
@@ -394,11 +508,11 @@ local function findStartButton()
                     local byText = false
                     if obj:IsA("TextButton") or obj:IsA("TextLabel") then
                         local text = obj.Text
-                        byText = #text <= 40 and cleanText(text) == "start"
+                        byText = #text <= 40 and START_TEXTS[cleanText(text)] == true
                     end
                     local isButton = obj:IsA("GuiButton")
                     local byName = isButton and START_NAMES[string.lower(obj.Name)]
-                    local isStartDungeonChild = isButton and obj.Parent.Name == "startDungeon"
+                    local isStartDungeonChild = isButton and obj.Parent and obj.Parent.Name == "startDungeon"
 
                     if (byText or byName or isStartDungeonChild) and isShown(obj) then
                         return resolveClickable(obj)
@@ -410,16 +524,100 @@ local function findStartButton()
     return nil
 end
 
+-- Dispara directamente las conexiones del botón (no depende de coordenadas ni de toques)
+local function fireButtonSignals(button)
+    if not button:IsA("GuiButton") then return false end
+    local getConns = (typeof(getconnections) == "function" and getconnections)
+        or (typeof(syn) == "table" and syn.get_signal_cons)
+    local names = { "Activated", "MouseButton1Click", "MouseButton1Down", "TouchTap" }
+
+    if typeof(getConns) == "function" then
+        for _, name in ipairs(names) do
+            local fired = false
+            local okSignal, signal = pcall(function() return button[name] end)
+            if okSignal and signal then
+                local okList, conns = pcall(getConns, signal)
+                if okList and type(conns) == "table" then
+                    for _, conn in ipairs(conns) do
+                        local okFire = pcall(function()
+                            if conn.Fire then conn:Fire()
+                            elseif conn.Function then task.spawn(conn.Function) end
+                        end)
+                        if okFire then fired = true end
+                    end
+                end
+            end
+            if fired then
+                if name == "Activated" or name == "MouseButton1Click" then return true end
+            end
+        end
+    end
+
+    if typeof(firesignal) == "function" then
+        local ok = pcall(function() firesignal(button.Activated) end)
+        if not ok then ok = pcall(function() firesignal(button.MouseButton1Click) end) end
+        return ok
+    end
+    return false
+end
+
+-- Toque real en pantalla (móvil) o clic de ratón (PC)
+local function sendTap(x, y, useTouch)
+    pcall(function()
+        if useTouch then
+            VirtualInputManager:SendTouchEvent(1, 0, x, y)
+            task.wait(0.06)
+            VirtualInputManager:SendTouchEvent(1, 2, x, y)
+        else
+            VirtualInputManager:SendMouseMoveEvent(x - 8, y, game)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseMoveEvent(x, y, game)
+            task.wait(0.12)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.06)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end
+    end)
+end
+
+-- Selección por GuiService + Enter (funciona aunque las coordenadas fallen)
+local function pressBySelection(button)
+    pcall(function()
+        GuiService.SelectedObject = button
+        task.wait(0.12)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+        task.wait(0.1)
+        GuiService.SelectedObject = nil
+    end)
+end
+
+local function getButtonCenter(button, withInset)
+    local center = button.AbsolutePosition + button.AbsoluteSize / 2
+    local screen = button:FindFirstAncestorWhichIsA("ScreenGui")
+    local ignoresInset = screen and screen.IgnoreGuiInset
+    -- Los ScreenGui que NO ignoran el inset miden desde debajo de la barra superior
+    local needsInset = not ignoresInset
+    if not withInset then needsInset = not needsInset end
+    if needsInset then
+        center = center + GuiService:GetGuiInset()
+    end
+    return math.floor(center.X), math.floor(center.Y)
+end
+
 local function tryPressStart()
     if not Config.AutoStart then return false end
-    if os.clock() < StartButton.giveUpUntil then return false end
-
     local now = os.clock()
+    if now < StartButton.giveUpUntil then return false end
+
     local button = StartButton.cache
     if not button or not button.Parent or not isShown(button) then
         StartButton.cache = nil
-        if now - StartButton.lastScan < START_SCAN_INTERVAL then return false end
+        local interval = StartButton.dirty and START_SCAN_FAST or START_SCAN_INTERVAL
+        if now - StartButton.lastScan < interval then return false end
         StartButton.lastScan = now
+        StartButton.dirty = false
         button = findStartButton()
         StartButton.cache = button
         if not button then
@@ -432,28 +630,34 @@ local function tryPressStart()
     StartButton.lastPress = now
     StartButton.attempts = StartButton.attempts + 1
 
-    if StartButton.attempts > 6 then
+    if StartButton.attempts > START_MAX_ATTEMPTS then
         StartButton.attempts = 0
         StartButton.cache = nil
-        StartButton.giveUpUntil = now + 15
+        StartButton.giveUpUntil = now + START_GIVE_UP
         return false
     end
 
-    local center = button.AbsolutePosition + button.AbsoluteSize / 2
-    if StartButton.attempts % 2 == 1 then
-        center = center + GuiService:GetGuiInset()
-    end
-    local x, y = math.floor(center.X), math.floor(center.Y)
+    local attempt = StartButton.attempts
+    local viaSignal = fireButtonSignals(button)
 
-    pcall(function()
-        VirtualInputManager:SendMouseMoveEvent(x - 8, y, game)
-        task.wait(0.05)
-        VirtualInputManager:SendMouseMoveEvent(x, y, game)
-        task.wait(0.15)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
-        task.wait(0.06)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
-    end)
+    -- Si las conexiones respondieron, damos una oportunidad antes de insistir con toques
+    if viaSignal and attempt == 1 then return true end
+
+    local phase = attempt % 3
+    if phase == 1 then
+        local x, y = getButtonCenter(button, true)
+        sendTap(x, y, IS_MOBILE or UserInputService.TouchEnabled)
+    elseif phase == 2 then
+        local x, y = getButtonCenter(button, false)
+        sendTap(x, y, IS_MOBILE or UserInputService.TouchEnabled)
+        if not IS_MOBILE then return true end
+        -- en móvil también probamos el clic emulado con las coordenadas alternas
+        sendTap(x, y, false)
+    else
+        pressBySelection(button)
+        local x, y = getButtonCenter(button, true)
+        sendTap(x, y, IS_MOBILE)
+    end
 
     return true
 end
@@ -869,6 +1073,7 @@ local function startFarm()
     State.running = true
     State.session = State.session + 1
     State.dodgeUntil = 0; State.dodgeOffset = 0
+    StartButton.giveUpUntil = 0; StartButton.attempts = 0; StartButton.dirty = true
     setStatus("Buscando enemigos...", "searching")
     task.spawn(farmLoop, State.session)
 end
@@ -1177,7 +1382,7 @@ local function buildUI()
 
     -- Encabezado
     local header = create("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1, Name = "Header", Size = UDim2.new(1, 0, 0, HEADER_HEIGHT) }, window)
-    local title = makeLabel(header, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(16, 8), Size = UDim2.new(1, -100, 0, 18), Text = "⚔️ Fabled Autofarm", TextSize = 15 })
+    local title = makeLabel(header, { Font = Enum.Font.GothamBold, Position = UDim2.fromOffset(16, 8), Size = UDim2.new(1, -100, 0, 18), Text = "Fabled Autofarm", TextSize = 15 })
     ui.titleStroke = create("UIStroke", { Color = WHITE, Thickness = 1.5, Transparency = 0.8 }, title)
     makeLabel(header, { Position = UDim2.fromOffset(16, 27), Size = UDim2.new(1, -100, 0, 14), Text = "Noir Edition · v" .. VERSION, TextColor3 = THEME.TextDim, TextSize = 11 })
 
@@ -1272,7 +1477,10 @@ local function buildUI()
     makeStepper(grid, 6, "Delay de ataque", "AttackDelay")
     makeStepper(grid, 7, "Radio de escaneo", "ScanRadius")
 
-    makeLabel(body, { LayoutOrder = 11, Name = "Footer", Size = UDim2.new(1, 0, 0, 14), Text = HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener  ·  " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI", TextColor3 = THEME.Muted, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center })
+    local footerText = IS_MOBILE
+        and "Toca INICIAR / DETENER para controlar el autofarm"
+        or (HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener  ·  " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI")
+    makeLabel(body, { LayoutOrder = 11, Name = "Footer", Size = UDim2.new(1, 0, 0, 14), Text = footerText, TextColor3 = THEME.Muted, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center })
 
     makeDraggable(header, shell)
     bind(closeButton.Activated, function() ui.close() end)
@@ -1448,6 +1656,13 @@ bind(UserInputService.InputBegan, function(input, gameProcessed)
     end
 end)
 
+-- Cuando aparece UI nueva en pantalla (menú de START, etc.), se adelanta el próximo escaneo
+bind(PlayerGui.DescendantAdded, function(descendant)
+    if descendant:IsA("GuiButton") or descendant:IsA("TextLabel") then
+        StartButton.dirty = true
+    end
+end)
+
 -- Anti-AFK: evita la expulsión por inactividad (~20 min)
 bind(LocalPlayer.Idled, function()
     if not Config.AntiAFK then return end
@@ -1460,6 +1675,8 @@ end)
 bind(LocalPlayer.CharacterAdded, function(character) task.spawn(watchCharacter, character) end)
 if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) end
 
+startEnemyRegistry()
+
 sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload }
 
 -- AUTO-INICIO: arranca el autofarm solo (desactivable con el chip "Auto-iniciar")
@@ -1471,5 +1688,6 @@ if Config.AutoRun then
 end
 
 ui.refresh()
-print(string.format("✅ Fabled Autofarm v%s (Noir Edition) cargado%s · %s: iniciar/detener · %s: ocultar UI",
-    VERSION, Config.AutoRun and " · AUTO-INICIADO" or "", HOTKEY_TOGGLE_FARM.Name, HOTKEY_TOGGLE_UI.Name))
+print(string.format("✅ Fabled Autofarm v%s (Noir Edition) cargado%s%s",
+    VERSION, Config.AutoRun and " · AUTO-INICIADO" or "",
+    IS_MOBILE and " · modo móvil" or (" · " .. HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener · " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI")))
