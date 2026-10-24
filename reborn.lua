@@ -1,23 +1,16 @@
 --[[
-    FABLED AUTOFARM (Universal) — v3.1 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.2 (Noir Edition)
 
-    NOVEDADES v3.1
-    • Sin emoji de espadas en el título.
-    • AUTO-START MÓVIL: detecta el botón START en más variantes (texto, nombre,
-      ImageButton con texto dentro), reacciona al instante cuando aparece una UI
-      nueva, dispara las conexiones del botón directamente (sin depender de
-      coordenadas) y, si hace falta, usa toques reales (SendTouchEvent) con
-      corrección automática del GuiInset, además de selección por GuiService.
-    • DETECCIÓN DE ENEMIGOS MEJORADA:
-        - Registro por eventos: cualquier Humanoid nuevo en el workspace se evalúa
-          al aparecer (no depende de carpetas conocidas).
-        - Dentro de carpetas de enemigos se aceptan enemigos de poca vida
-          (antes se ignoraba todo con menos de 500 de vida máxima).
-        - El filtro de "props" ya no descarta enemigos con nombres como
-          "Fire Elemental" o "Light Knight" (solo se aplica a modelos sin Humanoid).
-        - Ya no se descartan enemigos por estar dentro de una carpeta llamada "...Map".
-        - Escaneo recursivo también dentro de modelos-grupo en las carpetas de enemigos.
-        - Escaneo más frecuente y parte objetivo con más respaldos (PrimaryPart).
+    NOVEDADES v3.2
+    • Detector de enemigos ORIGINAL restaurado (el de la v3.0).
+    • Fix "Support Arch" y falsos objetivos similares:
+        - Palabras de decorado (arch, pillar, statue, gate...) se bloquean por
+          palabra completa (no afecta a "Archer", "Archmage", etc.), también en CamelCase.
+        - Un objetivo que no recibe daño / no desaparece tras varios segundos se
+          ignora 30 s, siempre que haya otros enemigos disponibles.
+    • Enemigos con Humanoid muerto ya no se siguen aunque conserven la parte "Circle".
+    • Auto-start móvil mejorado (conexiones del botón, toques reales, GuiInset,
+      selección por GuiService) y sin emoji de espadas.
     • Toda la lógica de combate / esquiva inteligente se mantiene intacta.
 
     Atajos:  RightControl = iniciar / detener  ·  RightShift = ocultar / mostrar UI
@@ -44,7 +37,7 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.1"
+local VERSION = "3.2"
 local GUI_NAME = "FabledAutofarmUI"
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -63,12 +56,11 @@ end
 local KEY_HOLD_TIME = 0.01
 local KEY_GAP_TIME = 0.01
 local CLICK_X, CLICK_Y = 0, 0
-local SCAN_INTERVAL = 0.35
-local IDLE_SCAN_INTERVAL = 0.3
-local WORKSPACE_FALLBACK_INTERVAL = 3
-local MAX_SCAN_DEPTH = 7
-local MIN_ENEMY_MAX_HEALTH = 500       -- fuera de carpetas de enemigos
-local MIN_FOLDER_ENEMY_HEALTH = 0      -- dentro de carpetas de enemigos (cualquier vida > 0)
+local SCAN_INTERVAL = 0.5
+local IDLE_SCAN_INTERVAL = 0.5
+local WORKSPACE_FALLBACK_INTERVAL = 2
+local MAX_SCAN_DEPTH = 6
+local MIN_ENEMY_MAX_HEALTH = 500
 local UI_REFRESH_INTERVAL = 0.1
 local TARGET_STICKY_DISTANCE = 12      -- el objetivo actual se conserva si otro no está al menos 12 studs más cerca
 
@@ -182,11 +174,6 @@ local ENEMY_FOLDERS = {
     "Enemies", "Bosses", "Boss", "DungeonMap", "Mobs", "Monsters", "WaveEnemies",
 }
 
-local ENEMY_FOLDER_SET = {}
-for _, folderName in ipairs(ENEMY_FOLDERS) do
-    ENEMY_FOLDER_SET[string.lower(folderName)] = true
-end
-
 -- ============================================================
 -- ESTADO COMPARTIDO
 -- ============================================================
@@ -215,42 +202,43 @@ end
 -- ============================================================
 -- DETECCIÓN DE ENEMIGOS
 -- ============================================================
-local npcNameCache = {}
-local propNameCache = {}
+local blockedNameCache = {}
 
-local function matchesList(name, list)
+-- Palabras COMPLETAS (no subcadenas) que indican decorado/estructura.
+-- Se comparan por palabra para no bloquear enemigos como "Archer" o "Archmage".
+local PROP_WORDS = {
+    arch = true, archway = true, arches = true, pillar = true, pillars = true,
+    column = true, columns = true, statue = true, gate = true, bridge = true,
+    stairs = true, stair = true, fence = true, barrel = true, crate = true,
+    banner = true, brazier = true, pedestal = true, altar = true, rubble = true,
+}
+
+local function hasPropWord(name)
+    for word in string.gmatch(name, "%u%l*") do        -- separa CamelCase: SupportArch -> Support, Arch
+        if PROP_WORDS[string.lower(word)] then return true end
+    end
+    for word in string.gmatch(string.lower(name), "%a+") do
+        if PROP_WORDS[word] then return true end
+    end
+    return false
+end
+
+local function isBlockedName(name)
+    local cached = blockedNameCache[name]
+    if cached ~= nil then return cached end
     local lowered = string.lower(name)
-    for _, word in ipairs(list) do
-        if string.find(lowered, word, 1, true) then return true end
+    local blocked = false
+    for _, word in ipairs(NAME_BLACKLIST) do
+        if string.find(lowered, word, 1, true) then blocked = true; break end
     end
-    return false
-end
-
-local function isNpcName(name)
-    local cached = npcNameCache[name]
-    if cached == nil then
-        cached = matchesList(name, NAME_BLACKLIST)
-        npcNameCache[name] = cached
+    if not blocked then
+        for _, word in ipairs(PROP_BLACKLIST) do
+            if string.find(lowered, word, 1, true) then blocked = true; break end
+        end
     end
-    return cached
-end
-
-local function isPropName(name)
-    local cached = propNameCache[name]
-    if cached == nil then
-        cached = matchesList(name, PROP_BLACKLIST)
-        propNameCache[name] = cached
-    end
-    return cached
-end
-
-local function isInEnemyFolder(model)
-    local node = model.Parent
-    while node and node ~= workspace and node ~= game do
-        if ENEMY_FOLDER_SET[string.lower(node.Name)] then return true end
-        node = node.Parent
-    end
-    return false
+    if not blocked then blocked = hasPropWord(name) end
+    blockedNameCache[name] = blocked
+    return blocked
 end
 
 local function getEnemyPart(model)
@@ -260,72 +248,40 @@ local function getEnemyPart(model)
     if head and head:IsA("BasePart") then return head end
     local rootPart = model:FindFirstChild("HumanoidRootPart")
     if rootPart and rootPart:IsA("BasePart") then return rootPart end
-    local primary = model.PrimaryPart
-    if primary and primary:IsA("BasePart") then return primary end
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if humanoid and humanoid.RootPart then return humanoid.RootPart end
-    return model:FindFirstChildWhichIsA("BasePart", true)
+    return model:FindFirstChildWhichIsA("BasePart")
 end
 
 local function isEnemy(model)
     if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false end
-    if isNpcName(model.Name) then return false end
+    if isBlockedName(model.Name) then return false end
     local parent = model.Parent
-    if parent and parent ~= workspace and isNpcName(parent.Name) then return false end
+    if parent and isBlockedName(parent.Name) then return false end
 
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     if humanoid then
+        -- Enemigo muerto que aún no desapareció: ya no es objetivo
         if humanoid.Health <= 0 then return false end
-        local minHealth = isInEnemyFolder(model) and MIN_FOLDER_ENEMY_HEALTH or MIN_ENEMY_MAX_HEALTH
-        if humanoid.MaxHealth > minHealth then return true end
+        if humanoid.MaxHealth > MIN_ENEMY_MAX_HEALTH then return true end
     end
-
-    -- Enemigos sin Humanoid válido: se detectan por la parte "Circle"
     local circle = model:FindFirstChild("Circle")
-    if circle and circle:IsA("BasePart") and not isPropName(model.Name) then return true end
-    return false
+    return circle ~= nil and circle:IsA("BasePart")
 end
 
--- Registro por eventos: todo Humanoid que aparezca en el workspace se evalúa solo
-local registry = setmetatable({}, { __mode = "k" })
-
-local function considerModel(model)
-    if not model or not model:IsA("Model") or not model.Parent then return end
-    if isEnemy(model) then registry[model] = true end
-end
-
-local function onWorkspaceDescendant(descendant)
-    if descendant:IsA("Humanoid") then
-        local model = descendant.Parent
-        -- pequeña espera: el modelo puede terminar de cargar sus partes después
-        task.delay(0.35, considerModel, model)
-    end
-end
-
-local function addFound(found, seen, model, origin)
-    if seen[model] then return end
-    local part = getEnemyPart(model)
-    if not part then return end
-    local dist = (part.Position - origin).Magnitude
-    if dist <= Config.ScanRadius then
-        seen[model] = true
-        table.insert(found, { model = model, part = part, dist = dist })
-    end
-end
-
--- deep = true: también entra a modelos-grupo que no son enemigos (solo en carpetas de enemigos)
-local function scanContainer(container, depth, found, seen, origin, deep)
+local function scanContainer(container, depth, found, origin)
     if depth > MAX_SCAN_DEPTH then return end
     for _, object in ipairs(container:GetChildren()) do
         if object:IsA("Model") then
             if isEnemy(object) then
-                addFound(found, seen, object, origin)
-            elseif deep and not object:FindFirstChildOfClass("Humanoid")
-                and not Players:GetPlayerFromCharacter(object) then
-                scanContainer(object, depth + 1, found, seen, origin, deep)
+                local part = getEnemyPart(object)
+                if part then
+                    local dist = (part.Position - origin).Magnitude
+                    if dist <= Config.ScanRadius then
+                        table.insert(found, { model = object, part = part, dist = dist })
+                    end
+                end
             end
         elseif object:IsA("Folder") then
-            scanContainer(object, depth + 1, found, seen, origin, deep)
+            scanContainer(object, depth + 1, found, origin)
         end
     end
 end
@@ -354,26 +310,54 @@ local function refreshCandidates(origin)
     end
 
     cache.time = now
-    local found, seen = {}, {}
+    local found = {}
     for _, folderName in ipairs(ENEMY_FOLDERS) do
         local folder = workspace:FindFirstChild(folderName)
-        if folder then scanContainer(folder, 0, found, seen, origin, true) end
-    end
-
-    -- Registro por eventos (enemigos fuera de carpetas conocidas)
-    for model in pairs(registry) do
-        if model.Parent then
-            if isEnemy(model) then addFound(found, seen, model, origin) end
-        else
-            registry[model] = nil
-        end
+        if folder then scanContainer(folder, 0, found, origin) end
     end
 
     if #found == 0 and now - (cache.fullTime or 0) >= WORKSPACE_FALLBACK_INTERVAL then
         cache.fullTime = now
-        scanContainer(workspace, 0, found, seen, origin, false)
+        scanContainer(workspace, 0, found, origin)
     end
     cache.list = found
+end
+
+-- Objetivos "atascados" (falsos positivos tipo decorado): se ignoran un rato
+-- SOLO si hay otros candidatos; si es el único, se sigue atacando como antes.
+local Ignored = setmetatable({}, { __mode = "k" })   -- [model] = os.clock() hasta el que se ignora
+local Watch = { model = nil, since = 0, health = nil, changedAt = 0 }
+local STUCK_NO_HUMANOID = 12     -- s atacando un objetivo sin Humanoid sin que desaparezca
+local STUCK_NO_DAMAGE = 15       -- s atacando un objetivo con Humanoid sin que baje su vida
+local IGNORE_SECONDS = 30
+
+local function resetWatch(enemy)
+    Watch.model = enemy
+    local now = os.clock()
+    Watch.since = now
+    Watch.changedAt = now
+    local humanoid = enemy and enemy:FindFirstChildOfClass("Humanoid")
+    Watch.health = humanoid and humanoid.Health or nil
+end
+
+-- Se llama solo mientras realmente se está atacando
+local function monitorTarget(enemy)
+    if not enemy then return end
+    if enemy ~= Watch.model then resetWatch(enemy); return end
+    local now = os.clock()
+    local humanoid = State.targetHumanoid
+    if humanoid and humanoid.Parent then
+        if humanoid.Health ~= Watch.health then
+            Watch.health = humanoid.Health
+            Watch.changedAt = now
+        elseif now - Watch.changedAt > STUCK_NO_DAMAGE then
+            Ignored[enemy] = now + IGNORE_SECONDS
+            Watch.changedAt = now
+        end
+    elseif now - Watch.since > STUCK_NO_HUMANOID then
+        Ignored[enemy] = now + IGNORE_SECONDS
+        Watch.since = now
+    end
 end
 
 -- Objetivo "pegajoso": se queda con el actual mientras siga vivo y no haya
@@ -381,33 +365,24 @@ end
 local function findClosestEnemy(origin)
     refreshCandidates(origin)
     local list = cache.list
-    local best, current = nil, nil
+    local now = os.clock()
+    local best, current, bestIgnored = nil, nil, nil
     local currentTarget = State.target
     for index = 1, #list do
         local entry = list[index]
-        if not best or entry.dist < best.dist then best = entry end
-        if currentTarget and entry.model == currentTarget then current = entry end
+        if (Ignored[entry.model] or 0) > now then
+            if not bestIgnored or entry.dist < bestIgnored.dist then bestIgnored = entry end
+        else
+            if not best or entry.dist < best.dist then best = entry end
+            if currentTarget and entry.model == currentTarget then current = entry end
+        end
     end
     if best and current and current ~= best and current.dist <= best.dist + TARGET_STICKY_DISTANCE then
         best = current
     end
+    best = best or bestIgnored
     if best then return best.model, best.part, #list end
     return nil, nil, 0
-end
-
--- Población inicial del registro + eventos (se hace una vez, cediendo el hilo)
-local function startEnemyRegistry()
-    bind(workspace.DescendantAdded, onWorkspaceDescendant)
-    task.spawn(function()
-        local count = 0
-        for _, descendant in ipairs(workspace:GetDescendants()) do
-            if descendant:IsA("Humanoid") then
-                considerModel(descendant.Parent)
-            end
-            count = count + 1
-            if count % 500 == 0 then task.wait() end
-        end
-    end)
 end
 
 -- ============================================================
@@ -436,7 +411,7 @@ local START_SCAN_INTERVAL = 2          -- escaneo normal
 local START_SCAN_FAST = 0.6            -- escaneo rápido cuando aparece UI nueva
 local START_RETRY_INTERVAL = 1.2
 local START_MAX_ATTEMPTS = 9
-local START_GIVE_UP = 6
+local START_GIVE_UP = 15
 local START_NAMES = {
     start = true, startbutton = true, startbtn = true, btnstart = true, startgame = true,
     startdungeon = true, startrun = true, playbutton = true, playbtn = true,
@@ -973,13 +948,17 @@ local function farmStep(session)
 
     if not enemy then
         setStatus("Buscando enemigos...", "searching")
+        resetWatch(nil)
     elseif isDodging() then
         setStatus("¡Esquivando!", "dodging")
+        Watch.changedAt = os.clock(); Watch.since = os.clock()
         if Config.AttackWhileDodging then attack(session) end
     elseif UserInputService:GetFocusedTextBox() then
         setStatus("Pausado (escribiendo)", "waiting")
+        Watch.changedAt = os.clock(); Watch.since = os.clock()
     else
         setStatus("Atacando", "attacking")
+        monitorTarget(enemy)
         attack(session)
     end
 end
@@ -1674,8 +1653,6 @@ end)
 
 bind(LocalPlayer.CharacterAdded, function(character) task.spawn(watchCharacter, character) end)
 if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) end
-
-startEnemyRegistry()
 
 sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload }
 
