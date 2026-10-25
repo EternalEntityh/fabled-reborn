@@ -1,17 +1,17 @@
 --[[
-    FABLED AUTOFARM (Universal) — v3.2 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.3 (Noir Edition)
 
-    NOVEDADES v3.2
-    • Detector de enemigos ORIGINAL restaurado (el de la v3.0).
-    • Fix "Support Arch" y falsos objetivos similares:
-        - Palabras de decorado (arch, pillar, statue, gate...) se bloquean por
-          palabra completa (no afecta a "Archer", "Archmage", etc.), también en CamelCase.
-        - Un objetivo que no recibe daño / no desaparece tras varios segundos se
-          ignora 30 s, siempre que haya otros enemigos disponibles.
-    • Enemigos con Humanoid muerto ya no se siguen aunque conserven la parte "Circle".
-    • Auto-start móvil mejorado (conexiones del botón, toques reales, GuiInset,
-      selección por GuiService) y sin emoji de espadas.
-    • Toda la lógica de combate / esquiva inteligente se mantiene intacta.
+    NOVEDADES v3.3  —  ANTI-VACÍO
+    • Ya no se sigue a un objetivo que se teletransporta / cae / está sobre el vacío:
+        - Antes de moverse a una posición nueva lejana se comprueba que haya SUELO debajo.
+        - Se descarta cualquier posición cercana al plano de destrucción (FallenPartsDestroyHeight).
+        - Si el objetivo está sobre el vacío, te quedas en el último punto seguro y,
+          pasados 1.5 s, se ignora ese objetivo 30 s (si hay otros).
+    • Rescate de emergencia: si caes mucho por debajo del último punto seguro
+      (o te acercas al plano de destrucción) te devuelve al punto seguro al instante.
+    • Teletransportes del propio juego (cambio de zona) se detectan y no activan el rescate.
+    • Nuevo chip "Anti-vacío" para activarlo/desactivarlo (activado por defecto).
+    • Toda la lógica de combate / esquiva inteligente / detector de enemigos se mantiene intacta.
 
     Atajos:  RightControl = iniciar / detener  ·  RightShift = ocultar / mostrar UI
 ]]
@@ -37,7 +37,7 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.2"
+local VERSION = "3.3"
 local GUI_NAME = "FabledAutofarmUI"
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -96,6 +96,7 @@ local DEFAULTS = {
     AutoStart = true,      -- pulsa el botón START del juego
     AutoRun = true,        -- inicia el autofarm solo al ejecutar el script
     AntiAFK = true,
+    VoidGuard = true,      -- anti-vacío: no seguir objetivos sobre el vacío + rescate de caídas
 }
 
 local LIMITS = {
@@ -183,6 +184,7 @@ local State = {
     hoverPos = nil, candidates = 0, dodgeUntil = 0, kills = 0, runSeconds = 0,
     dodges = 0, dodgeSeconds = 0,
     status = "Detenido", statusKind = "stopped",
+    voidSkip = false,
 }
 
 State.dodgeOffset = 0
@@ -887,6 +889,115 @@ function Dodge.destroy()
 end
 -- >>> FIN DEL BLOQUE DE ESQUIVA <<<
 
+-- >>> INICIO DEL BLOQUE ANTI-VACÍO (v3.3) <<<
+local VOID_DROP = 50                -- caída máxima permitida bajo el último punto seguro antes de rescatarte
+local VOID_MARGIN = 80              -- distancia mínima sobre el plano de destrucción (FallenPartsDestroyHeight)
+local TELEPORT_JUMP = 100           -- un salto mayor del objetivo se considera teletransporte (se exige suelo)
+local EXTERNAL_TELEPORT = 250       -- salto de TU personaje no causado por el script (cambio de zona)
+local GROUND_RAY_LENGTH = 600       -- hasta dónde se busca suelo bajo el objetivo
+local GROUND_CHECK_INTERVAL = 0.15  -- cada cuánto se comprueba el suelo bajo el objetivo
+local GROUND_CHECK_FAST = 0.05      -- ritmo de comprobación cuando el objetivo acaba de saltar
+local NOGROUND_TOLERANCE = 45       -- sin suelo, solo se acepta si está así de cerca de un punto ya verificado
+local REJECT_IGNORE_AFTER = 1.5     -- s rechazando el mismo objetivo antes de ignorarlo
+
+local Safety = {
+    anchor = nil,          -- último punto seguro (con suelo verificado) al que volver
+    lastTargetPos = nil,   -- última posición de objetivo aceptada
+    lastRootPos = nil,     -- posición de tu personaje al final del último paso
+    groundOk = true,
+    groundCheckAt = 0,
+    lastRescue = 0,
+    rescues = 0,
+    rejectSince = nil,
+}
+
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+pcall(function() groundParams.RespectCanCollide = true end)
+
+function Safety.reset()
+    Safety.anchor = nil
+    Safety.lastTargetPos = nil
+    Safety.lastRootPos = nil
+    Safety.groundOk = true
+    Safety.groundCheckAt = 0
+    Safety.rejectSince = nil
+    State.voidSkip = false
+end
+
+local function getKillY()
+    local y = workspace.FallenPartsDestroyHeight
+    if y ~= y then return -math.huge end
+    return y
+end
+
+-- ¿Hay suelo sólido bajo esta posición? (ignora tu personaje y a los enemigos)
+local function hasGroundBelow(pos)
+    local filter = { LocalPlayer.Character }
+    for _, entry in ipairs(cache.list) do
+        table.insert(filter, entry.model)
+    end
+    if State.target then table.insert(filter, State.target) end
+    groundParams.FilterDescendantsInstances = filter
+    local ok, result = pcall(function()
+        return workspace:Raycast(pos + Vector3.new(0, 5, 0), Vector3.new(0, -GROUND_RAY_LENGTH, 0), groundParams)
+    end)
+    if not ok then return true end   -- ante un error no bloqueamos el autofarm
+    return result ~= nil
+end
+
+-- ¿Es seguro ir a la posición de este objetivo?
+function Safety.isTargetPosSafe(pos, now)
+    if pos.X ~= pos.X or pos.Y ~= pos.Y or pos.Z ~= pos.Z then return false end
+
+    local killY = getKillY()
+    if killY > -math.huge and pos.Y < killY + VOID_MARGIN then return false end
+
+    local jumped = Safety.lastTargetPos ~= nil and (pos - Safety.lastTargetPos).Magnitude > TELEPORT_JUMP
+    local interval = jumped and GROUND_CHECK_FAST or GROUND_CHECK_INTERVAL
+    if now - Safety.groundCheckAt >= interval then
+        Safety.groundCheckAt = now
+        Safety.groundOk = hasGroundBelow(pos)
+    end
+
+    local hover = pos + Vector3.new(0, Config.FlightHeight, 0)
+    if Safety.groundOk then
+        Safety.anchor = hover
+        Safety.lastTargetPos = pos
+        return true
+    end
+
+    -- Sin suelo debajo: solo se acepta si está muy cerca de un punto que ya sabemos seguro
+    local anchor = Safety.anchor
+    if anchor and (hover - anchor).Magnitude <= NOGROUND_TOLERANCE and hover.Y >= anchor.Y - 25 then
+        Safety.lastTargetPos = pos
+        return true
+    end
+    return false
+end
+
+-- Si caes demasiado (o te acercas al plano de destrucción), vuelve al último punto seguro
+function Safety.rescue(root, now)
+    local anchor = Safety.anchor
+    if not anchor then return end
+    local y = root.Position.Y
+    local killY = getKillY()
+    local tooLow = y < anchor.Y - VOID_DROP
+    local nearKill = killY > -math.huge and y < killY + VOID_MARGIN
+    if not (tooLow or nearKill) then return end
+    if now - Safety.lastRescue < 0.15 then return end
+
+    Safety.lastRescue = now
+    Safety.rescues = Safety.rescues + 1
+    root.CFrame = CFrame.new(anchor)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    if DODGE_DEBUG then
+        print(string.format("[Fabled Autofarm] Anti-vacío: rescatado (caída detectada) · rescates %d", Safety.rescues))
+    end
+end
+-- >>> FIN DEL BLOQUE ANTI-VACÍO <<<
+
 local function canKeepAttacking(session)
     return State.running and State.session == session
         and (Config.AttackWhileDodging or not isDodging())
@@ -957,7 +1068,11 @@ local function farmStep(session)
         setStatus("Pausado (escribiendo)", "waiting")
         Watch.changedAt = os.clock(); Watch.since = os.clock()
     else
-        setStatus("Atacando", "attacking")
+        if State.voidSkip then
+            setStatus("Objetivo sobre el vacío (sin seguir)", "waiting")
+        else
+            setStatus("Atacando", "attacking")
+        end
         monitorTarget(enemy)
         attack(session)
     end
@@ -982,6 +1097,7 @@ local function watchCharacter(character)
     if healthConnection then healthConnection:Disconnect(); healthConnection = nil end
     State.root = nil; State.humanoid = nil; State.hoverPos = nil; State.dodgeUntil = 0
     State.dodgeOffset = 0
+    Safety.reset()
 
     local humanoid = character:WaitForChild("Humanoid", 10)
     local rootPart = character:WaitForChild("HumanoidRootPart", 10)
@@ -1014,11 +1130,45 @@ local function hoverStep()
         lastHoverClock = now
 
         local root, humanoid = State.root, State.humanoid
-        if not root or not root.Parent or not humanoid or humanoid.Health <= 0 then return end
+        if not root or not root.Parent or not humanoid or humanoid.Health <= 0 then
+            Safety.lastRootPos = nil
+            return
+        end
+
+        local guard = Config.VoidGuard
+
+        if guard then
+            -- Teletransporte ajeno al script (cambio de zona del juego): el punto seguro anterior ya no vale
+            if Safety.lastRootPos and (root.Position - Safety.lastRootPos).Magnitude > EXTERNAL_TELEPORT then
+                Safety.anchor = nil
+                Safety.lastTargetPos = nil
+            end
+            -- Si pisas suelo, ese es un punto seguro
+            if humanoid.FloorMaterial ~= Enum.Material.Air then
+                Safety.anchor = root.Position + Vector3.new(0, 3, 0)
+            end
+            -- Caída detectada: volver al último punto seguro
+            Safety.rescue(root, now)
+        end
 
         local part = State.targetPart
         if part and part.Parent then
-            State.hoverPos = part.Position + Vector3.new(0, Config.FlightHeight, 0)
+            local targetPos = part.Position
+            if (not guard) or Safety.isTargetPosSafe(targetPos, now) then
+                State.hoverPos = targetPos + Vector3.new(0, Config.FlightHeight, 0)
+                Safety.rejectSince = nil
+                State.voidSkip = false
+            else
+                -- Objetivo sobre el vacío / teletransportado: no lo sigas, quédate en el último punto
+                State.voidSkip = true
+                Safety.rejectSince = Safety.rejectSince or now
+                if now - Safety.rejectSince > REJECT_IGNORE_AFTER and State.target then
+                    Ignored[State.target] = now + IGNORE_SECONDS
+                    Safety.rejectSince = now
+                end
+            end
+        else
+            State.voidSkip = false
         end
 
         -- Predicción de ataque
@@ -1031,7 +1181,10 @@ local function hoverStep()
         if goal == 0 and State.dodgeOffset < 0.05 then State.dodgeOffset = 0 end
 
         local hoverPos = State.hoverPos
-        if not hoverPos then return end
+        if not hoverPos then
+            Safety.lastRootPos = root.Position
+            return
+        end
         hoverPos = hoverPos + Vector3.new(0, State.dodgeOffset, 0)
 
         if hoverPos.X ~= hoverPos.X or hoverPos.Y ~= hoverPos.Y or hoverPos.Z ~= hoverPos.Z then
@@ -1041,6 +1194,7 @@ local function hoverStep()
         root.CFrame = CFrame.new(hoverPos)
         root.AssemblyLinearVelocity = Vector3.zero
         root.AssemblyAngularVelocity = Vector3.zero
+        Safety.lastRootPos = root.Position
     end)
 end
 
@@ -1052,6 +1206,7 @@ local function startFarm()
     State.running = true
     State.session = State.session + 1
     State.dodgeUntil = 0; State.dodgeOffset = 0
+    Safety.reset()
     StartButton.giveUpUntil = 0; StartButton.attempts = 0; StartButton.dirty = true
     setStatus("Buscando enemigos...", "searching")
     task.spawn(farmLoop, State.session)
@@ -1063,6 +1218,7 @@ local function stopFarm()
     State.session = State.session + 1
     State.target = nil; State.targetPart = nil; State.targetHumanoid = nil; State.hoverPos = nil
     State.candidates = 0; State.dodgeUntil = 0; State.dodgeOffset = 0; cache.list = {}
+    Safety.reset()
     setStatus("Detenido", "stopped")
 end
 
@@ -1074,6 +1230,7 @@ end
 local function resetStats()
     State.kills = 0; State.runSeconds = 0
     State.dodges = 0; State.dodgeSeconds = 0
+    Safety.rescues = 0
     if ui.refresh then ui.refresh() end
 end
 
@@ -1431,7 +1588,7 @@ local function buildUI()
 
     -- Combate
     makeSectionHeader(body, 6, "COMBATE", "Borrar aprendido", resetLearned)
-    local chipsRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 7, Name = "Chips", Size = UDim2.new(1, 0, 0, 66) }, body)
+    local chipsRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 7, Name = "Chips", Size = UDim2.new(1, 0, 0, 102) }, body)
     create("UIGridLayout", { CellPadding = UDim2.fromOffset(6, 6), CellSize = UDim2.new(0.25, -5, 0, 30), SortOrder = Enum.SortOrder.LayoutOrder }, chipsRow)
     makeChip(chipsRow, 1, "Esquiva", "DodgeEnabled")
     makeChip(chipsRow, 2, "Skill F", "UseSkillF")
@@ -1441,6 +1598,7 @@ local function buildUI()
     makeChip(chipsRow, 6, "Anti-AFK", "AntiAFK")
     makeChip(chipsRow, 7, "Atk+Esq", "AttackWhileDodging")
     makeChip(chipsRow, 8, "Auto-iniciar", "AutoRun")
+    makeChip(chipsRow, 9, "Anti-vacío", "VoidGuard")
 
     ui.dodgeInfo = makeLabel(body, { LayoutOrder = 8, Name = "DodgeInfo", Size = UDim2.new(1, 0, 0, 14), Text = "", TextColor3 = THEME.TextDim, TextSize = 10 })
 
@@ -1600,8 +1758,8 @@ function ui.refresh()
         setText(ui.kpmLabel, string.format("%.1f", minutes > 0.05 and State.kills / minutes or 0))
 
         local airPercent = State.runSeconds > 1 and (State.dodgeSeconds / State.runSeconds * 100) or 0
-        setText(ui.dodgeInfo, string.format("Aprendidos %d · Esquivas %d · Esquivando %d%% del tiempo",
-            Dodge.learnedCount, State.dodges, math.floor(airPercent + 0.5)))
+        setText(ui.dodgeInfo, string.format("Aprendidos %d · Esquivas %d · Aire %d%% · Rescates %d",
+            Dodge.learnedCount, State.dodges, math.floor(airPercent + 0.5), Safety.rescues))
     end)
 end
 
