@@ -1,19 +1,19 @@
 --[[
-    FABLED AUTOFARM (Universal) — v3.3 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.4 (Noir Edition)
 
-    NOVEDADES v3.3  —  ANTI-VACÍO
-    • Ya no se sigue a un objetivo que se teletransporta / cae / está sobre el vacío:
-        - Antes de moverse a una posición nueva lejana se comprueba que haya SUELO debajo.
-        - Se descarta cualquier posición cercana al plano de destrucción (FallenPartsDestroyHeight).
-        - Si el objetivo está sobre el vacío, te quedas en el último punto seguro y,
-          pasados 1.5 s, se ignora ese objetivo 30 s (si hay otros).
-    • Rescate de emergencia: si caes mucho por debajo del último punto seguro
-      (o te acercas al plano de destrucción) te devuelve al punto seguro al instante.
-    • Teletransportes del propio juego (cambio de zona) se detectan y no activan el rescate.
-    • Nuevo chip "Anti-vacío" para activarlo/desactivarlo (activado por defecto).
-    • Toda la lógica de combate / esquiva inteligente / detector de enemigos se mantiene intacta.
+    NOVEDADES v3.4
+    • El NPC que cura YA NO se detecta como enemigo:
+        - Se bloquean más nombres (heal, medic, cleric, priest, nurse, companion, ally, pet...).
+        - Se revisa TAMBIÉN el nombre de todos los contenedores padre (no solo el directo).
+        - Se descartan modelos con ProximityPrompt (los NPC interactivos) o con atributo de dueño.
+        - Botón "Excluir objetivo" (o RightAlt): excluye por nombre el objetivo actual y lo guarda
+          en un archivo, así si algún NPC aún se cuela lo quitas en un toque y no vuelve.
+    • TODAS las opciones de combate se quitaron de la UI y quedan SIEMPRE ACTIVADAS:
+      Esquiva, Skill F, Skill R, Click, Start, Anti-AFK, Atk+Esq, Auto-iniciar y Anti-vacío.
+    • Todo lo demás (esquiva inteligente, anti-vacío, ajustes numéricos) se mantiene igual.
 
     Atajos:  RightControl = iniciar / detener  ·  RightShift = ocultar / mostrar UI
+             RightAlt = excluir el objetivo actual
 ]]
 
 -- ============================================================
@@ -37,7 +37,7 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.3"
+local VERSION = "3.4"
 local GUI_NAME = "FabledAutofarmUI"
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -72,6 +72,7 @@ local DODGE_REACTIVE_MAX = 0.15        -- esquiva reactiva corta cuando el ataqu
 
 local HOTKEY_TOGGLE_FARM = Enum.KeyCode.RightControl
 local HOTKEY_TOGGLE_UI = Enum.KeyCode.RightShift
+local HOTKEY_EXCLUDE = Enum.KeyCode.RightAlt
 
 local WINDOW_WIDTH = 340
 local HEADER_HEIGHT = 50
@@ -89,7 +90,7 @@ local DEFAULTS = {
     AttackDelay = 0.03,
     ScanRadius = 5000,
     DodgeEnabled = true,
-    AttackWhileDodging = false,
+    AttackWhileDodging = true,
     UseSkillF = true,
     UseSkillR = true,
     UseClick = true,
@@ -97,6 +98,13 @@ local DEFAULTS = {
     AutoRun = true,        -- inicia el autofarm solo al ejecutar el script
     AntiAFK = true,
     VoidGuard = true,      -- anti-vacío: no seguir objetivos sobre el vacío + rescate de caídas
+}
+
+-- Opciones de combate: ya no están en la UI y SIEMPRE quedan activadas
+-- (aunque un archivo de config viejo las tenga en false).
+local ALWAYS_ON = {
+    "DodgeEnabled", "AttackWhileDodging", "UseSkillF", "UseSkillR", "UseClick",
+    "AutoStart", "AutoRun", "AntiAFK", "VoidGuard",
 }
 
 local LIMITS = {
@@ -153,15 +161,28 @@ local function saveConfig()
 end
 
 loadConfig()
+for _, key in ipairs(ALWAYS_ON) do Config[key] = true end
 
 -- ============================================================
 -- LISTAS DE FILTRADO
 -- ============================================================
--- Nombres exactos de NPCs / cosas que NUNCA son enemigos
+-- Nombres (subcadena) de NPCs / cosas que NUNCA son enemigos
 local NAME_BLACKLIST = {
     "stranger", "geoff", "buy bundle", "level milestone", "speedrun leaderboard",
     "change lobby music", "check runs", "promptpart", "wishing well", "sirpixel",
     "healer", "companion", "healercompanion", "dummy", "training", "spawnpoint",
+}
+
+-- Nombres (subcadena) de NPCs amistosos: curanderos, ayudantes, tiendas...
+-- Se comprueban en el modelo Y en TODOS sus contenedores padre.
+local FRIENDLY_SUBSTRINGS = {
+    "heal", "medic", "cleric", "priest", "nurse", "doctor", "companion",
+    "merchant", "vendor", "shopkeeper", "helper", "follower", "blessing",
+}
+
+-- Palabras COMPLETAS (separadas por CamelCase) de NPCs amistosos
+local FRIENDLY_WORDS = {
+    pet = true, npc = true, ally = true, friend = true, shop = true, healer = true,
 }
 
 -- Solo se aplica a modelos SIN Humanoid válido (los que se detectan por la parte "Circle")
@@ -202,9 +223,39 @@ local function bind(signal, callback)
 end
 
 -- ============================================================
+-- EXCLUSIONES DEL USUARIO (por nombre, guardadas en archivo)
+-- ============================================================
+local EXCLUDE_FILE = "FabledAutofarm_excluded_v34.json"
+local Excluded = {}   -- [nombre] = true
+
+local function loadExcluded()
+    if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" then return end
+    pcall(function()
+        if not isfile(EXCLUDE_FILE) then return end
+        local data = HttpService:JSONDecode(readfile(EXCLUDE_FILE))
+        if type(data) == "table" then
+            for _, name in ipairs(data) do
+                if type(name) == "string" then Excluded[name] = true end
+            end
+        end
+    end)
+end
+
+local function saveExcluded()
+    if typeof(writefile) ~= "function" then return end
+    pcall(function()
+        local names = {}
+        for name in pairs(Excluded) do table.insert(names, name) end
+        writefile(EXCLUDE_FILE, HttpService:JSONEncode(names))
+    end)
+end
+loadExcluded()
+
+-- ============================================================
 -- DETECCIÓN DE ENEMIGOS
 -- ============================================================
 local blockedNameCache = {}
+local friendlyNameCache = {}
 
 -- Palabras COMPLETAS (no subcadenas) que indican decorado/estructura.
 -- Se comparan por palabra para no bloquear enemigos como "Archer" o "Archmage".
@@ -215,12 +266,12 @@ local PROP_WORDS = {
     banner = true, brazier = true, pedestal = true, altar = true, rubble = true,
 }
 
-local function hasPropWord(name)
+local function hasWord(name, set)
     for word in string.gmatch(name, "%u%l*") do        -- separa CamelCase: SupportArch -> Support, Arch
-        if PROP_WORDS[string.lower(word)] then return true end
+        if set[string.lower(word)] then return true end
     end
     for word in string.gmatch(string.lower(name), "%a+") do
-        if PROP_WORDS[word] then return true end
+        if set[word] then return true end
     end
     return false
 end
@@ -238,9 +289,62 @@ local function isBlockedName(name)
             if string.find(lowered, word, 1, true) then blocked = true; break end
         end
     end
-    if not blocked then blocked = hasPropWord(name) end
+    if not blocked then blocked = hasWord(name, PROP_WORDS) end
     blockedNameCache[name] = blocked
     return blocked
+end
+
+-- ¿El nombre es de un NPC amistoso (curandero, ayudante, tienda...)?
+local function isFriendlyName(name)
+    local cached = friendlyNameCache[name]
+    if cached ~= nil then return cached end
+    local lowered = string.lower(name)
+    local friendly = false
+    for _, word in ipairs(FRIENDLY_SUBSTRINGS) do
+        if string.find(lowered, word, 1, true) then friendly = true; break end
+    end
+    if not friendly then friendly = hasWord(name, FRIENDLY_WORDS) end
+    friendlyNameCache[name] = friendly
+    return friendly
+end
+
+-- Comprobación "estructural" de NPC amistoso (cacheada, se repite cada 3 s por si el modelo carga tarde):
+--  · el propio modelo o cualquier contenedor padre tiene nombre amistoso
+--  · el modelo tiene un ProximityPrompt (NPC con el que se interactúa)
+--  · el modelo tiene un atributo de dueño (compañero / mascota de un jugador)
+local friendlyModelCache = setmetatable({}, { __mode = "k" })
+local OWNER_ATTRIBUTES = { "Owner", "OwnerId", "OwnerName", "Master", "Summoner", "Ally", "Friendly" }
+
+local function looksFriendly(model)
+    local now = os.clock()
+    local entry = friendlyModelCache[model]
+    if entry and now - entry.at < 3 then return entry.value end
+
+    local value = false
+    if isFriendlyName(model.Name) then
+        value = true
+    else
+        local node = model.Parent
+        while node and node ~= workspace and node ~= game do
+            if isFriendlyName(node.Name) then value = true; break end
+            node = node.Parent
+        end
+    end
+
+    if not value then
+        for _, attribute in ipairs(OWNER_ATTRIBUTES) do
+            if model:GetAttribute(attribute) ~= nil then value = true; break end
+        end
+    end
+
+    if not value then
+        for _, descendant in ipairs(model:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") then value = true; break end
+        end
+    end
+
+    friendlyModelCache[model] = { value = value, at = now }
+    return value
 end
 
 local function getEnemyPart(model)
@@ -255,9 +359,11 @@ end
 
 local function isEnemy(model)
     if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false end
+    if Excluded[model.Name] then return false end
     if isBlockedName(model.Name) then return false end
     local parent = model.Parent
     if parent and isBlockedName(parent.Name) then return false end
+    if looksFriendly(model) then return false end
 
     local humanoid = model:FindFirstChildOfClass("Humanoid")
     if humanoid then
@@ -385,6 +491,18 @@ local function findClosestEnemy(origin)
     best = best or bestIgnored
     if best then return best.model, best.part, #list end
     return nil, nil, 0
+end
+
+-- Excluye (por nombre, de forma permanente) el objetivo actual
+local function excludeCurrentTarget()
+    local target = State.target
+    if not target then return end
+    Excluded[target.Name] = true
+    saveExcluded()
+    State.target = nil; State.targetPart = nil; State.targetHumanoid = nil; State.hoverPos = nil
+    cache.list = {}
+    cache.time = 0
+    print("[Fabled Autofarm] Excluido de forma permanente: " .. target.Name)
 end
 
 -- ============================================================
@@ -1401,33 +1519,6 @@ local function makeStat(parent, order, caption)
     return value
 end
 
-local function makeChip(parent, order, text, key)
-    local function getBase() return Config[key] and THEME.ButtonOn or THEME.SurfaceAlt end
-    local chip = makeButton(parent, { BackgroundColor3 = getBase(), LayoutOrder = order, Name = key, Text = text, TextSize = 11 })
-    round(chip, 8)
-    local stroke = outline(chip)
-    local glow = addGlow(chip, 8, WHITE, { { 2, 1 }, { 4, 1 } })
-    local feedback = attachButtonFeedback(chip, getBase)
-    local glowOn = { 0.68, 0.88 }
-
-    local function render()
-        local enabled = Config[key]
-        TweenService:Create(chip, TWEEN_FAST, { TextColor3 = enabled and BLACK or THEME.TextDim }):Play()
-        tween(stroke, TWEEN_FAST, { Color = enabled and WHITE or THEME.Stroke })
-        for index, layer in ipairs(glow) do
-            tween(layer.stroke, TWEEN_MEDIUM, { Transparency = enabled and glowOn[index] or 1 })
-        end
-        feedback()
-    end
-    chip.TextColor3 = Config[key] and BLACK or THEME.TextDim
-    render()
-    bind(chip.Activated, function()
-        Config[key] = not Config[key]
-        render()
-        saveConfig()
-    end)
-end
-
 local function makeStepper(parent, order, labelText, key)
     local limit = LIMITS[key]
     local cell = create("Frame", { BackgroundTransparency = 1, LayoutOrder = order }, parent)
@@ -1546,13 +1637,23 @@ local function buildUI()
     ui.body = body; ui.list = list
 
     -- Estado
-    local statusRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 1, Name = "StatusRow", Size = UDim2.new(1, 0, 0, 18) }, body)
+    local statusRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 1, Name = "StatusRow", Size = UDim2.new(1, 0, 0, 20) }, body)
     local dot = create("Frame", { AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = STATUS_COLORS.stopped, BorderSizePixel = 0, Name = "Dot", Position = UDim2.new(0, 4, 0.5, 0), Size = UDim2.fromOffset(9, 9) }, statusRow)
     round(dot, 5)
     ui.dotStroke = create("UIStroke", { ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Color = STATUS_COLORS.stopped, Thickness = 4, Transparency = 0.85 }, dot)
     ui.statusDot = dot
     ui.pulse = TweenService:Create(dot, TWEEN_PULSE, { BackgroundTransparency = 0.6 })
-    ui.statusLabel = makeLabel(statusRow, { Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -22, 1, 0), Text = State.status })
+    ui.statusLabel = makeLabel(statusRow, { Font = Enum.Font.GothamMedium, Position = UDim2.fromOffset(22, 0), Size = UDim2.new(1, -140, 1, 0), Text = State.status })
+
+    -- Botón para excluir el objetivo actual (p. ej. un NPC que cura y se coló como enemigo)
+    local excludeButton = makeButton(statusRow, { AnchorPoint = Vector2.new(1, 0.5), Font = Enum.Font.GothamMedium, Name = "ExcludeButton", Position = UDim2.new(1, 0, 0.5, 0), Size = UDim2.fromOffset(112, 20), Text = "Excluir objetivo", TextColor3 = THEME.TextDim, TextSize = 10 })
+    round(excludeButton, 6); outline(excludeButton)
+    attachButtonFeedback(excludeButton, function() return THEME.SurfaceAlt end)
+    attachTextHover(excludeButton, THEME.TextDim, THEME.Danger)
+    bind(excludeButton.Activated, function()
+        excludeCurrentTarget()
+        if ui.refresh then ui.refresh() end
+    end)
 
     -- Botón principal con glow propio
     local mainWrap = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 2, Name = "ToggleWrap", Size = UDim2.new(1, 0, 0, 42) }, body)
@@ -1586,20 +1687,8 @@ local function buildUI()
     ui.timeLabel = makeStat(statsRow, 2, "TIEMPO")
     ui.kpmLabel = makeStat(statsRow, 3, "KILLS/MIN")
 
-    -- Combate
-    makeSectionHeader(body, 6, "COMBATE", "Borrar aprendido", resetLearned)
-    local chipsRow = create("Frame", { BackgroundTransparency = 1, LayoutOrder = 7, Name = "Chips", Size = UDim2.new(1, 0, 0, 102) }, body)
-    create("UIGridLayout", { CellPadding = UDim2.fromOffset(6, 6), CellSize = UDim2.new(0.25, -5, 0, 30), SortOrder = Enum.SortOrder.LayoutOrder }, chipsRow)
-    makeChip(chipsRow, 1, "Esquiva", "DodgeEnabled")
-    makeChip(chipsRow, 2, "Skill F", "UseSkillF")
-    makeChip(chipsRow, 3, "Skill R", "UseSkillR")
-    makeChip(chipsRow, 4, "Click", "UseClick")
-    makeChip(chipsRow, 5, "Start", "AutoStart")
-    makeChip(chipsRow, 6, "Anti-AFK", "AntiAFK")
-    makeChip(chipsRow, 7, "Atk+Esq", "AttackWhileDodging")
-    makeChip(chipsRow, 8, "Auto-iniciar", "AutoRun")
-    makeChip(chipsRow, 9, "Anti-vacío", "VoidGuard")
-
+    -- Combate (las opciones ya no se muestran: siempre están activadas)
+    makeSectionHeader(body, 6, "COMBATE (SIEMPRE ACTIVO)", "Borrar aprendido", resetLearned)
     ui.dodgeInfo = makeLabel(body, { LayoutOrder = 8, Name = "DodgeInfo", Size = UDim2.new(1, 0, 0, 14), Text = "", TextColor3 = THEME.TextDim, TextSize = 10 })
 
     -- Ajustes
@@ -1616,7 +1705,7 @@ local function buildUI()
 
     local footerText = IS_MOBILE
         and "Toca INICIAR / DETENER para controlar el autofarm"
-        or (HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener  ·  " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI")
+        or (HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener  ·  " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI  ·  " .. HOTKEY_EXCLUDE.Name .. ": excluir objetivo")
     makeLabel(body, { LayoutOrder = 11, Name = "Footer", Size = UDim2.new(1, 0, 0, 14), Text = footerText, TextColor3 = THEME.Muted, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center })
 
     makeDraggable(header, shell)
@@ -1790,6 +1879,8 @@ bind(UserInputService.InputBegan, function(input, gameProcessed)
         toggleFarm()
     elseif input.KeyCode == HOTKEY_TOGGLE_UI and ui.gui then
         ui.toggleVisible()
+    elseif input.KeyCode == HOTKEY_EXCLUDE then
+        excludeCurrentTarget()
     end
 end)
 
@@ -1814,7 +1905,7 @@ if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) 
 
 sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload }
 
--- AUTO-INICIO: arranca el autofarm solo (desactivable con el chip "Auto-iniciar")
+-- AUTO-INICIO: el autofarm arranca solo al ejecutar el script
 if Config.AutoRun then
     task.defer(function()
         startFarm()
@@ -1825,4 +1916,4 @@ end
 ui.refresh()
 print(string.format("✅ Fabled Autofarm v%s (Noir Edition) cargado%s%s",
     VERSION, Config.AutoRun and " · AUTO-INICIADO" or "",
-    IS_MOBILE and " · modo móvil" or (" · " .. HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener · " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI")))
+    IS_MOBILE and " · modo móvil" or (" · " .. HOTKEY_TOGGLE_FARM.Name .. ": iniciar/detener · " .. HOTKEY_TOGGLE_UI.Name .. ": ocultar UI · " .. HOTKEY_EXCLUDE.Name .. ": excluir objetivo")))
