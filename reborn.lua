@@ -1,5 +1,13 @@
 --[[
-    FABLED AUTOFARM (Universal) — v3.5 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.6 (Noir Edition)
+
+    NOVEDADES v3.6
+    • Filtro por comportamiento: un modelo con TODAS sus partes ancladas se considera decorado
+      y se descarta (REQUIRE_UNANCHORED). Se recomprueba cada 3 s, así un jefe anclado durante
+      su intro se acepta cuando lo sueltan. Si un enemigo real estático deja de detectarse,
+      pon REQUIRE_UNANCHORED = false.
+    • El anti-atasco ahora BANEA: un objetivo que falla el anti-atasco 2 veces (o que el
+      anti-vacío ignora 2 veces) queda baneado para toda la sesión y ya no vuelve a elegirse.
 
     NOVEDADES v3.5
     • Detección en dos niveles: la estricta de siempre primero; si no hay ningún objetivo activo
@@ -48,7 +56,7 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.5"
+local VERSION = "3.6"
 local GUI_NAME = "FabledAutofarmUI"
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -417,6 +425,31 @@ local function logReject(model, reason)
         model.Name, model.Parent and model.Parent.Name or "?", reason))
 end
 
+-- Un enemigo real tiene alguna parte sin anclar; el decorado suele estar todo anclado
+local REQUIRE_UNANCHORED = true
+local decorCache = setmetatable({}, { __mode = "k" })
+
+local function looksDecorative(model)
+    if not REQUIRE_UNANCHORED then return false end
+    local now = os.clock()
+    local entry = decorCache[model]
+    if entry and now - entry.at < 3 then return entry.value end
+
+    local decorative = true
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") and not d.Anchored then
+            decorative = false
+            break
+        end
+    end
+    decorCache[model] = { value = decorative, at = now }
+    return decorative
+end
+
+-- Objetivos que fallaron el anti-atasco 2 veces: baneados para esta sesión
+local Strikes = setmetatable({}, { __mode = "k" })
+local Banned = setmetatable({}, { __mode = "k" })
+
 -- Devuelve (true) o (false, motivo)
 local function classifyEnemy(model, loose)
     if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false, "jugador" end
@@ -441,6 +474,8 @@ local function classifyEnemy(model, loose)
     end
 
     if looksFriendly(model) then return false, "NPC amistoso (nombre/prompt/atributo)" end
+    if Banned[model] then return false, "baneado (atascado 2 veces sin recibir daño)" end
+    if looksDecorative(model) then return false, "todo anclado (decorado)" end
 
     if validHumanoid or looseHumanoid then return true end
     if humanoid then return false, "vida máxima baja (" .. tostring(humanoid.MaxHealth) .. ")" end
@@ -572,11 +607,21 @@ end
 
 -- Objetivos "atascados" (falsos positivos tipo decorado): se ignoran un rato
 -- SOLO si hay otros candidatos; si es el único, se sigue atacando como antes.
+-- Tras 2 fallos quedan baneados para toda la sesión (ver ignoreTarget).
 -- (Ignored ya está declarado en el bloque de detección)
 local Watch = { model = nil, since = 0, health = nil, changedAt = 0 }
 local STUCK_NO_HUMANOID = 12     -- s atacando un objetivo sin Humanoid sin que desaparezca
 local STUCK_NO_DAMAGE = 15       -- s atacando un objetivo con Humanoid sin que baje su vida
 local IGNORE_SECONDS = 30
+
+local function ignoreTarget(enemy, now)
+    Ignored[enemy] = now + IGNORE_SECONDS
+    Strikes[enemy] = (Strikes[enemy] or 0) + 1
+    if Strikes[enemy] >= 2 then
+        Banned[enemy] = true
+        print("[Fabled Autofarm] Baneado (sin daño): " .. enemy.Name)
+    end
+end
 
 local function resetWatch(enemy)
     Watch.model = enemy
@@ -598,11 +643,11 @@ local function monitorTarget(enemy)
             Watch.health = humanoid.Health
             Watch.changedAt = now
         elseif now - Watch.changedAt > STUCK_NO_DAMAGE then
-            Ignored[enemy] = now + IGNORE_SECONDS
+            ignoreTarget(enemy, now)
             Watch.changedAt = now
         end
     elseif now - Watch.since > STUCK_NO_HUMANOID then
-        Ignored[enemy] = now + IGNORE_SECONDS
+        ignoreTarget(enemy, now)
         Watch.since = now
     end
 end
@@ -1421,7 +1466,7 @@ local function hoverStep()
                 Safety.rejectSince = Safety.rejectSince or now
                 if now - Safety.rejectSince > REJECT_IGNORE_AFTER and State.target then
                     print("[Fabled Autofarm] Anti-vacío ignoró a '" .. State.target.Name .. "' (sin suelo / zona de destrucción)")
-                    Ignored[State.target] = now + IGNORE_SECONDS
+                    ignoreTarget(State.target, now)
                     Safety.rejectSince = now
                 end
             end
