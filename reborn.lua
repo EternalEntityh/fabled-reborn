@@ -1,5 +1,16 @@
 --[[
-    FABLED AUTOFARM (Universal) — v3.4 (Noir Edition)
+    FABLED AUTOFARM (Universal) — v3.5 (Noir Edition)
+
+    NOVEDADES v3.5
+    • Detección en dos niveles: la estricta de siempre primero; si no hay ningún objetivo activo
+      entra un MODO AMPLIO que busca cualquier Humanoid vivo del workspace (incluso en Models anidados).
+    • La lista de "decorado" (PROP_BLACKLIST) ya solo se aplica a modelos SIN Humanoid válido,
+      así "Fire Slime" o "Wall Breaker" ya no se descartan por subcadena.
+    • El contenedor padre ya no se bloquea por la lista de decorado (DungeonMap, Spawns...).
+    • Un atributo de dueño en false / 0 / "" ya no cuenta como "NPC amistoso".
+    • Modo debug: imprime en consola por qué se rechaza cada candidato (DEBUG_DETECTION).
+    • Avisa al cargar de las exclusiones guardadas y FabledAutofarm.ClearExcluded() las borra.
+    • El anti-vacío imprime en consola cuando ignora a un objetivo.
 
     NOVEDADES v3.4
     • El NPC que cura YA NO se detecta como enemigo:
@@ -37,7 +48,7 @@ while not LocalPlayer do
 end
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local VERSION = "3.4"
+local VERSION = "3.5"
 local GUI_NAME = "FabledAutofarmUI"
 local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -254,7 +265,6 @@ loadExcluded()
 -- ============================================================
 -- DETECCIÓN DE ENEMIGOS
 -- ============================================================
-local blockedNameCache = {}
 local friendlyNameCache = {}
 
 -- Palabras COMPLETAS (no subcadenas) que indican decorado/estructura.
@@ -274,24 +284,6 @@ local function hasWord(name, set)
         if set[word] then return true end
     end
     return false
-end
-
-local function isBlockedName(name)
-    local cached = blockedNameCache[name]
-    if cached ~= nil then return cached end
-    local lowered = string.lower(name)
-    local blocked = false
-    for _, word in ipairs(NAME_BLACKLIST) do
-        if string.find(lowered, word, 1, true) then blocked = true; break end
-    end
-    if not blocked then
-        for _, word in ipairs(PROP_BLACKLIST) do
-            if string.find(lowered, word, 1, true) then blocked = true; break end
-        end
-    end
-    if not blocked then blocked = hasWord(name, PROP_WORDS) end
-    blockedNameCache[name] = blocked
-    return blocked
 end
 
 -- ¿El nombre es de un NPC amistoso (curandero, ayudante, tienda...)?
@@ -333,7 +325,8 @@ local function looksFriendly(model)
 
     if not value then
         for _, attribute in ipairs(OWNER_ATTRIBUTES) do
-            if model:GetAttribute(attribute) ~= nil then value = true; break end
+            local attr = model:GetAttribute(attribute)
+            if attr ~= nil and attr ~= false and attr ~= "" and attr ~= 0 then value = true; break end
         end
     end
 
@@ -357,22 +350,108 @@ local function getEnemyPart(model)
     return model:FindFirstChildWhichIsA("BasePart")
 end
 
-local function isEnemy(model)
-    if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false end
-    if Excluded[model.Name] then return false end
-    if isBlockedName(model.Name) then return false end
-    local parent = model.Parent
-    if parent and isBlockedName(parent.Name) then return false end
-    if looksFriendly(model) then return false end
+-- ============================================================
+-- DETECCIÓN v3.5 (estricta + modo amplio de respaldo)
+-- ============================================================
+local DEBUG_DETECTION = true
+local LOOSE_SCAN_INTERVAL = 1.5
+
+local ENEMY_FOLDER_SET = {}
+for _, name in ipairs(ENEMY_FOLDERS) do ENEMY_FOLDER_SET[name] = true end
+
+local Ignored = setmetatable({}, { __mode = "k" })   -- [model] = os.clock() hasta el que se ignora
+
+-- Bloqueo DURO: NPCs conocidos (aplica siempre)
+local hardNameCache = {}
+local function isHardBlockedName(name)
+    local cached = hardNameCache[name]
+    if cached ~= nil then return cached end
+    local lowered = string.lower(name)
+    local blocked = false
+    for _, word in ipairs(NAME_BLACKLIST) do
+        if string.find(lowered, word, 1, true) then blocked = true; break end
+    end
+    hardNameCache[name] = blocked
+    return blocked
+end
+
+-- Bloqueo de DECORADO: solo para modelos SIN Humanoid válido
+local propNameCache = {}
+local function isPropName(name)
+    local cached = propNameCache[name]
+    if cached ~= nil then return cached end
+    local lowered = string.lower(name)
+    local blocked = false
+    for _, word in ipairs(PROP_BLACKLIST) do
+        if string.find(lowered, word, 1, true) then blocked = true; break end
+    end
+    if not blocked then blocked = hasWord(name, PROP_WORDS) end
+    propNameCache[name] = blocked
+    return blocked
+end
+
+-- Exclusiones del usuario: avisa al cargar y permite borrarlas
+do
+    local names = {}
+    for name in pairs(Excluded) do table.insert(names, name) end
+    if #names > 0 then
+        print("[Fabled Autofarm] Exclusiones activas: " .. table.concat(names, ", ")
+            .. "  (FabledAutofarm.ClearExcluded() las borra)")
+    end
+end
+local function clearExcluded()
+    for name in pairs(Excluded) do Excluded[name] = nil end
+    saveExcluded()
+    cache.list = {}
+    cache.time = 0
+    print("[Fabled Autofarm] Exclusiones borradas")
+end
+
+local rejectLog = setmetatable({}, { __mode = "k" })
+local function logReject(model, reason)
+    if not DEBUG_DETECTION then return end
+    local now = os.clock()
+    if rejectLog[model] and now - rejectLog[model] < 15 then return end
+    rejectLog[model] = now
+    print(string.format("[Fabled Autofarm] Rechazado '%s' (%s) -> %s",
+        model.Name, model.Parent and model.Parent.Name or "?", reason))
+end
+
+-- Devuelve (true) o (false, motivo)
+local function classifyEnemy(model, loose)
+    if model == LocalPlayer.Character or Players:GetPlayerFromCharacter(model) then return false, "jugador" end
+    if Excluded[model.Name] then return false, "excluido por ti (nombre guardado)" end
+    if isHardBlockedName(model.Name) then return false, "nombre en lista negra" end
 
     local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        -- Enemigo muerto que aún no desapareció: ya no es objetivo
-        if humanoid.Health <= 0 then return false end
-        if humanoid.MaxHealth > MIN_ENEMY_MAX_HEALTH then return true end
+    if humanoid and humanoid.Health <= 0 then return false, "muerto" end
+
+    local validHumanoid = humanoid ~= nil and humanoid.MaxHealth > MIN_ENEMY_MAX_HEALTH
+    local looseHumanoid = loose and humanoid ~= nil and humanoid.MaxHealth > 0
+
+    local parent = model.Parent
+    if parent and isHardBlockedName(parent.Name) then return false, "contenedor en lista negra" end
+
+    -- Filtros de decorado: solo para lo que NO es un Humanoid claro
+    if not (validHumanoid or looseHumanoid) then
+        if isPropName(model.Name) then return false, "nombre de decorado" end
+        if parent and not ENEMY_FOLDER_SET[parent.Name] and isPropName(parent.Name) then
+            return false, "contenedor de decorado"
+        end
     end
+
+    if looksFriendly(model) then return false, "NPC amistoso (nombre/prompt/atributo)" end
+
+    if validHumanoid or looseHumanoid then return true end
+    if humanoid then return false, "vida máxima baja (" .. tostring(humanoid.MaxHealth) .. ")" end
+
     local circle = model:FindFirstChild("Circle")
-    return circle ~= nil and circle:IsA("BasePart")
+    if circle and circle:IsA("BasePart") then return true end
+    return false, "sin Humanoid ni Circle"
+end
+
+local function isEnemy(model, loose)
+    return (classifyEnemy(model, loose))
 end
 
 local function scanContainer(container, depth, found, origin)
@@ -394,6 +473,38 @@ local function scanContainer(container, depth, found, origin)
     end
 end
 
+-- Modo amplio: cualquier Humanoid vivo del workspace (incluye Models anidados)
+local function scanLoose(origin)
+    local result, seen, count = {}, {}, 0
+    for _, descendant in ipairs(workspace:GetDescendants()) do
+        count = count + 1
+        if count % 3000 == 0 then task.wait() end
+        if descendant:IsA("Humanoid") then
+            local model = descendant.Parent
+            if model and model:IsA("Model") and not seen[model] then
+                seen[model] = true
+                local ok, reason = classifyEnemy(model, true)
+                if ok then
+                    local part = getEnemyPart(model)
+                    if part then
+                        local dist = (part.Position - origin).Magnitude
+                        if dist <= Config.ScanRadius then
+                            table.insert(result, { model = model, part = part, dist = dist, loose = true })
+                        else
+                            logReject(model, "fuera del radio de escaneo (" .. math.floor(dist) .. ")")
+                        end
+                    end
+                elseif descendant.Health > 0 then
+                    logReject(model, reason)
+                end
+            end
+        end
+    end
+    return result
+end
+
+local looseAt, looseList = 0, {}
+
 local function refreshCandidates(origin)
     local now = os.clock()
     local list = cache.list
@@ -403,7 +514,7 @@ local function refreshCandidates(origin)
         local valid = {}
         for _, entry in ipairs(list) do
             local model = entry.model
-            if model.Parent and isEnemy(model) then
+            if model.Parent and isEnemy(model, entry.loose) then
                 local part = getEnemyPart(model)
                 if part then
                     entry.part = part
@@ -428,12 +539,40 @@ local function refreshCandidates(origin)
         cache.fullTime = now
         scanContainer(workspace, 0, found, origin)
     end
+
+    -- Si no hay ningún objetivo activo (todo vacío o ignorado), entra el modo amplio
+    local active = false
+    for _, entry in ipairs(found) do
+        if (Ignored[entry.model] or 0) <= now then active = true; break end
+    end
+    if not active then
+        if now - looseAt >= LOOSE_SCAN_INTERVAL then
+            looseAt = now
+            looseList = scanLoose(origin)
+        end
+        local known = {}
+        for _, entry in ipairs(found) do known[entry.model] = true end
+        for _, entry in ipairs(looseList) do
+            local model = entry.model
+            if not known[model] and model.Parent and isEnemy(model, true) then
+                local part = getEnemyPart(model)
+                if part then
+                    entry.part = part
+                    entry.dist = (part.Position - origin).Magnitude
+                    table.insert(found, entry)
+                end
+            end
+        end
+    else
+        looseList = {}
+    end
+
     cache.list = found
 end
 
 -- Objetivos "atascados" (falsos positivos tipo decorado): se ignoran un rato
 -- SOLO si hay otros candidatos; si es el único, se sigue atacando como antes.
-local Ignored = setmetatable({}, { __mode = "k" })   -- [model] = os.clock() hasta el que se ignora
+-- (Ignored ya está declarado en el bloque de detección)
 local Watch = { model = nil, since = 0, health = nil, changedAt = 0 }
 local STUCK_NO_HUMANOID = 12     -- s atacando un objetivo sin Humanoid sin que desaparezca
 local STUCK_NO_DAMAGE = 15       -- s atacando un objetivo con Humanoid sin que baje su vida
@@ -1281,6 +1420,7 @@ local function hoverStep()
                 State.voidSkip = true
                 Safety.rejectSince = Safety.rejectSince or now
                 if now - Safety.rejectSince > REJECT_IGNORE_AFTER and State.target then
+                    print("[Fabled Autofarm] Anti-vacío ignoró a '" .. State.target.Name .. "' (sin suelo / zona de destrucción)")
                     Ignored[State.target] = now + IGNORE_SECONDS
                     Safety.rejectSince = now
                 end
@@ -1903,7 +2043,7 @@ end)
 bind(LocalPlayer.CharacterAdded, function(character) task.spawn(watchCharacter, character) end)
 if LocalPlayer.Character then task.spawn(watchCharacter, LocalPlayer.Character) end
 
-sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload }
+sharedEnv.FabledAutofarm = { Version = VERSION, Start = startFarm, Stop = stopFarm, Unload = unload, ClearExcluded = clearExcluded }
 
 -- AUTO-INICIO: el autofarm arranca solo al ejecutar el script
 if Config.AutoRun then
